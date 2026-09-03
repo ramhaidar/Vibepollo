@@ -3,6 +3,8 @@
  * @brief Definitions for cryptography functions.
  */
 // lib includes
+#include <openssl/bn.h>
+#include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 
@@ -26,6 +28,54 @@ namespace crypto {
 
   void cert_chain_t::clear() {
     _certs.clear();
+  }
+
+  std::string spki_sha256_fingerprint(const X509 *x509) {
+    if (!x509) {
+      return {};
+    }
+
+    auto *pkey = X509_get_pubkey(const_cast<X509 *>(x509));
+    if (!pkey) {
+      return {};
+    }
+    auto pkey_guard = util::fail_guard([pkey]() {
+      EVP_PKEY_free(pkey);
+    });
+
+    unsigned char *der = nullptr;
+    const int der_len = i2d_PUBKEY(pkey, &der);
+    if (der_len <= 0 || !der) {
+      return {};
+    }
+    auto der_guard = util::fail_guard([der]() {
+      OPENSSL_free(der);
+    });
+
+    auto digest = hash(std::string_view {reinterpret_cast<const char *>(der), static_cast<std::size_t>(der_len)});
+
+    static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string b64;
+    b64.reserve(((digest.size() + 2) / 3) * 4);
+    for (std::size_t i = 0; i < digest.size(); i += 3) {
+      const auto b0 = digest[i];
+      const auto b1 = i + 1 < digest.size() ? digest[i + 1] : 0;
+      const auto b2 = i + 2 < digest.size() ? digest[i + 2] : 0;
+      b64.push_back(alphabet[b0 >> 2]);
+      b64.push_back(alphabet[((b0 & 0x03) << 4) | (b1 >> 4)]);
+      if (i + 1 < digest.size()) {
+        b64.push_back(alphabet[((b1 & 0x0F) << 2) | (b2 >> 6)]);
+      }
+      if (i + 2 < digest.size()) {
+        b64.push_back(alphabet[b2 & 0x3F]);
+      }
+    }
+
+    return "sha256/" + b64;
+  }
+
+  std::string spki_sha256_fingerprint(const x509_t &x509) {
+    return spki_sha256_fingerprint(x509.get());
   }
 
   std::string subject_name(const X509 *x509) {

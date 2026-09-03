@@ -20,6 +20,7 @@
 
 // local includes
 #include "crypto.h"
+#include "direct_auth.h"
 #include "rtsp.h"
 #include "thread_safe.h"
 
@@ -386,4 +387,45 @@ namespace nvhttp {
    * @note Exposed so subsystems (e.g. update) can trigger a save after mutating persisted fields.
    */
   void save_state();
+
+  /**
+   * @brief Mutable global Direct Auth manager used by the HTTPS and admin paths.
+   */
+  direct_auth::DirectAuthManager &get_direct_auth_manager();
+
+  /**
+   * @brief SPKI SHA-256 fingerprint of the host HTTPS server certificate.
+   */
+  std::string host_fingerprint();
+
+  /**
+   * @brief Admin-only snapshot of Direct Auth enrollment/pending/blocked state.
+   * @note This returns setup_uri/enrollment_id only to authenticated admin callers.
+   */
+  nlohmann::json direct_auth_admin_snapshot();
+
+  /**
+   * @brief Open a Direct Auth enrollment window from an authenticated admin caller.
+   * @param host The routable host/IP to embed in the setup URI.
+   * @param https_port The HTTPS port to embed in the setup URI.
+   */
+  nlohmann::json direct_auth_open_enrollment(const std::string &host, std::uint16_t https_port, std::int64_t ttl_ms = direct_auth::ENROLLMENT_TTL_MS);
+
+  bool direct_auth_close_enrollment();
+
+  /**
+   * @brief Accept a pending enrollment and create a normal trusted device.
+   */
+  bool direct_auth_accept_pending(const std::string &pending_id);
+
+  bool direct_auth_deny_pending(const std::string &pending_id);
+
+  bool direct_auth_block_fingerprint(const std::string &fingerprint, const std::string &reason = "denied", const std::string &name = {}, const std::string &uuid = {});
+
+  /**
+   * @brief Revoke a trusted device by fingerprint, persist state, and terminate active sessions.
+   */
+  bool direct_auth_revoke_fingerprint(const std::string &fingerprint);
+
+  bool direct_auth_unblock_fingerprint(const std::string &fingerprint);
 }  // namespace nvhttp

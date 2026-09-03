@@ -20,6 +20,7 @@ import ClientSettingsEditor, {
   type DisplayDevice,
   type HdrProfileEntry,
 } from '@/components/devices/ClientSettingsEditor.vue';
+import DirectAuthPanel from '@/components/devices/DirectAuthPanel.vue';
 import { settingsDefaults } from '@/configs/settingsSchema';
 import { formatRelativeTime } from '@/utils/format';
 
@@ -42,6 +43,7 @@ interface PairedDevice {
   virtual_display_layout?: string;
   always_use_virtual_display?: boolean;
   prefer_10bit_sdr?: boolean;
+  fingerprint?: string;
   config_overrides?: Record<string, unknown>;
 }
 
@@ -61,7 +63,7 @@ interface ClientCommandEntry {
 }
 
 interface PendingAction {
-  kind: 'disconnect' | 'unpair';
+  kind: 'disconnect' | 'unpair' | 'revoke';
   device: PairedDevice;
 }
 
@@ -89,6 +91,7 @@ const busyUuid = ref('');
 const openEditors = ref<Set<string>>(new Set());
 const pendingAction = ref<PendingAction | null>(null);
 const confirmOpen = ref(false);
+const directAuthPanel = ref<InstanceType<typeof DirectAuthPanel> | null>(null);
 let refreshTimer: number | undefined;
 
 const filteredDevices = computed(() => {
@@ -122,16 +125,26 @@ const deviceCounts = computed(() => ({
 
 const confirmTitle = computed(() => {
   if (!pendingAction.value) return t('ui.devices.confirm.generic_title');
-  return pendingAction.value.kind === 'unpair'
-    ? t('clients.confirm_remove_title_named', { name: pendingAction.value.device.name })
-    : t('ui.devices.confirm.disconnect_title', { name: pendingAction.value.device.name });
+  const action = pendingAction.value;
+  if (action.kind === 'unpair') {
+    return t('clients.confirm_remove_title_named', { name: action.device.name });
+  }
+  if (action.kind === 'revoke') {
+    return t('ui.devices.direct_auth.revoke_confirm_title', { name: action.device.name });
+  }
+  return t('ui.devices.confirm.disconnect_title', { name: action.device.name });
 });
 
 const confirmDescription = computed(() => {
   if (!pendingAction.value) return '';
-  return pendingAction.value.kind === 'unpair'
-    ? t('clients.confirm_remove_message_named', { name: pendingAction.value.device.name })
-    : t('ui.devices.confirm.disconnect_description');
+  const action = pendingAction.value;
+  if (action.kind === 'unpair') {
+    return t('clients.confirm_remove_message_named', { name: action.device.name });
+  }
+  if (action.kind === 'revoke') {
+    return t('ui.devices.direct_auth.revoke_confirm_description', { name: action.device.name });
+  }
+  return t('ui.devices.confirm.disconnect_description');
 });
 
 function reconcileStable(current: PairedDevice[], incoming: PairedDevice[]): PairedDevice[] {
@@ -417,7 +430,10 @@ function updatePayload(device: PairedDevice, draft: ClientDeviceDraft): Record<s
     enable_legacy_ordering: draft.enableLegacyOrdering,
     allow_client_commands: draft.allowClientCommands,
     do: draft.doCommands.map((entry) => ({ cmd: entry.command.trim(), elevated: entry.elevated })),
-    undo: draft.undoCommands.map((entry) => ({ cmd: entry.command.trim(), elevated: entry.elevated })),
+    undo: draft.undoCommands.map((entry) => ({
+      cmd: entry.command.trim(),
+      elevated: entry.elevated,
+    })),
     display_mode: draft.displayMode.trim(),
     output_name_override: outputName,
     always_use_virtual_display:
@@ -570,22 +586,36 @@ async function confirmAction(): Promise<void> {
   notice.value = '';
   busyUuid.value = action.device.uuid;
   try {
-    const path = action.kind === 'unpair' ? '/api/clients/unpair' : '/api/clients/disconnect';
-    const response = await apiPost<MutationResponse>(path, { uuid: action.device.uuid });
-    if (response.status !== true) {
-      throw new Error(
+    if (action.kind === 'revoke') {
+      if (!action.device.fingerprint) {
+        throw new Error(t('ui.devices.direct_auth.error.fingerprint_missing'));
+      }
+      const response = await apiPost<MutationResponse>('/api/direct-auth/revoke', {
+        fingerprint: action.device.fingerprint,
+      });
+      if (response.status !== true) {
+        throw new Error(t('ui.devices.direct_auth.error.revoke_rejected'));
+      }
+      notice.value = t('ui.devices.direct_auth.notice.revoked', { name: action.device.name });
+    } else {
+      const path = action.kind === 'unpair' ? '/api/clients/unpair' : '/api/clients/disconnect';
+      const response = await apiPost<MutationResponse>(path, { uuid: action.device.uuid });
+      if (response.status !== true) {
+        throw new Error(
+          action.kind === 'unpair'
+            ? t('ui.devices.error.unpair_rejected')
+            : t('clients.disconnect_failed'),
+        );
+      }
+      notice.value =
         action.kind === 'unpair'
-          ? t('ui.devices.error.unpair_rejected')
-          : t('clients.disconnect_failed'),
-      );
+          ? t('ui.devices.notice.unpaired', { name: action.device.name })
+          : t('ui.devices.notice.disconnected', { name: action.device.name });
     }
-    notice.value =
-      action.kind === 'unpair'
-        ? t('ui.devices.notice.unpaired', { name: action.device.name })
-        : t('ui.devices.notice.disconnected', { name: action.device.name });
     confirmOpen.value = false;
     pendingAction.value = null;
     await loadDevices(true);
+    await directAuthPanel.value?.refresh();
   } catch (cause) {
     error.value =
       cause instanceof ApiError
@@ -768,6 +798,18 @@ onBeforeUnmount(() => {
                   :aria-label="t('ui.devices.action.unpair_named', { name: device.name })"
                   @click="requestAction('unpair', device)"
                 />
+                <AppButton
+                  v-if="device.fingerprint"
+                  :label="t('ui.devices.direct_auth.action.revoke')"
+                  icon="x-circle"
+                  variant="danger"
+                  size="compact"
+                  :disabled="busyUuid === device.uuid"
+                  :aria-label="
+                    t('ui.devices.direct_auth.action.revoke_named', { name: device.name })
+                  "
+                  @click="requestAction('revoke', device)"
+                />
               </div>
             </div>
 
@@ -810,6 +852,8 @@ onBeforeUnmount(() => {
           </article>
         </li>
       </ul>
+
+      <DirectAuthPanel ref="directAuthPanel" @changed="loadDevices(true)" />
     </div>
 
     <ConfirmDialog
@@ -819,10 +863,14 @@ onBeforeUnmount(() => {
       :confirm-label="
         pendingAction?.kind === 'unpair'
           ? t('ui.devices.confirm.unpair_label')
-          : t('ui.devices.confirm.disconnect_label')
+          : pendingAction?.kind === 'revoke'
+            ? t('ui.devices.direct_auth.action.revoke')
+            : t('ui.devices.confirm.disconnect_label')
       "
       :cancel-label="t('_common.cancel')"
-      :tone="pendingAction?.kind === 'unpair' ? 'danger' : 'default'"
+      :tone="
+        pendingAction?.kind === 'unpair' || pendingAction?.kind === 'revoke' ? 'danger' : 'default'
+      "
       :busy="Boolean(pendingAction && busyUuid === pendingAction.device.uuid)"
       :busy-label="t('ui.devices.action.working')"
       :close-on-confirm="false"

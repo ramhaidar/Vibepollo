@@ -357,6 +357,70 @@
       "working": "Working..."
     },
     "devices": {
+      "direct_auth": {
+        "section_aria": "Vibe Direct Auth device management",
+        "title": "Add or review devices",
+        "description": "Open a short enrollment window to add a new device, approve requests, and manage blocked or revoked access.",
+        "loading": "Loading Direct Auth device state...",
+        "expired": "Enrollment window expired",
+        "expires_in": "Expires in {minutes}:{seconds}",
+        "open_instructions": "In the Moonlight or Artemis client, choose Add Computer or Vibe Direct Auth and enter this one-time enrollment link before it expires.",
+        "idle_instructions": "Open a short-lived enrollment window. Unknown clients cannot request access while it is closed.",
+        "unknown_name": "Unnamed device",
+        "unknown_time": "Time unknown",
+        "status": {
+          "open": "Enrollment open",
+          "blocked": "Blocked",
+          "revoked": "Revoked"
+        },
+        "action": {
+          "add_device": "Add Device",
+          "allow": "Allow",
+          "close": "Close enrollment",
+          "copy": "Copy",
+          "deny_block": "Deny & block",
+          "fingerprint": "Show fingerprint",
+          "revoke": "Revoke",
+          "revoke_named": "Revoke {name}",
+          "unblock": "Unblock"
+        },
+        "alert": {
+          "failed": "Direct Auth action failed",
+          "updated": "Direct Auth state updated"
+        },
+        "pending": {
+          "title": "Pending devices"
+        },
+        "blocked": {
+          "title": "Blocked and revoked devices"
+        },
+        "revoke_confirm_title": "Revoke {name}?",
+        "revoke_confirm_description": "This removes the trusted certificate, disconnects any active session, and blocks future Direct Auth requests until you unblock the device.",
+        "error": {
+          "load": "Unable to load Direct Auth state.",
+          "open": "Unable to open an enrollment window.",
+          "open_rejected": "The host did not open an enrollment window.",
+          "close": "Unable to close the enrollment window.",
+          "accept": "Unable to accept this pending device.",
+          "accept_rejected": "The host did not accept this pending device.",
+          "deny": "Unable to deny and block this pending device.",
+          "deny_rejected": "The host did not deny this pending device.",
+          "unblock": "Unable to unblock this device.",
+          "unblock_rejected": "The host did not unblock this device.",
+          "fingerprint_missing": "This paired device does not expose a Direct Auth fingerprint, so it cannot be revoked from this list.",
+          "revoke_rejected": "The host did not revoke this device.",
+          "copy": "Unable to copy the enrollment link."
+        },
+        "notice": {
+          "opened": "Enrollment is open. Copy the link and use it in the client before it expires.",
+          "closed": "Enrollment is closed.",
+          "accepted": "{name} was accepted as a trusted device.",
+          "denied": "{name} was denied and blocked.",
+          "revoked": "{name} was revoked.",
+          "unblocked": "{name} was unblocked.",
+          "copied": "Enrollment link copied."
+        }
+      },
       "action": {
         "disconnect_named": "Disconnect {name}",
         "pair": "Pair device",

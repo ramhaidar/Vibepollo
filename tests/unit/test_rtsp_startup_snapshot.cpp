@@ -28,6 +28,7 @@ namespace {
     ls.control_connect_data = 0xABCDu;
     ls.unique_id = "unique-id";
     ls.client_uuid = "client-uuid";
+    ls.client_fingerprint = "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     ls.device_name = "device-name";
     ls.perm = crypto::PERM::_all;
     ls.fps = 120;

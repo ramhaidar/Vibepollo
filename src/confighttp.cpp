@@ -2858,6 +2858,165 @@ namespace confighttp {
     send_response(response, output_tree);
   }
 
+  void getDirectAuth(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+    send_response(response, nvhttp::direct_auth_admin_snapshot(), "no-store");
+  }
+
+  void openDirectAuthEnrollment(resp_https_t response, req_https_t request) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    try {
+      nlohmann::json input_tree = nlohmann::json::parse(request->content.string());
+      const auto host = input_tree.value("host", std::string());
+      const auto https_port = input_tree.value("https_port", static_cast<uint16_t>(net::map_port(nvhttp::PORT_HTTPS)));
+      const auto ttl_ms = input_tree.value("ttl_ms", static_cast<std::int64_t>(direct_auth::ENROLLMENT_TTL_MS));
+
+      auto output_tree = nvhttp::direct_auth_open_enrollment(host, https_port, ttl_ms);
+      send_response(response, std::move(output_tree), "no-store");
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "OpenDirectAuthEnrollment: "sv << e.what();
+      bad_request(response, request, e.what());
+    }
+  }
+
+  void closeDirectAuthEnrollment(resp_https_t response, req_https_t request) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    nvhttp::get_direct_auth_manager().close_enrollment();
+    send_response(response, {{"status", true}}, "no-store");
+  }
+
+  void acceptDirectAuthPending(resp_https_t response, req_https_t request) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    try {
+      const auto input_tree = nlohmann::json::parse(request->content.string());
+      const auto pending_id = input_tree.value("pending_id", std::string());
+      if (pending_id.empty()) {
+        bad_request(response, request, "pending_id is required");
+        return;
+      }
+
+      const bool accepted = nvhttp::direct_auth_accept_pending(pending_id);
+      send_response(response, {{"status", accepted}, {"accepted", accepted}}, "no-store");
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "AcceptDirectAuthPending: "sv << e.what();
+      bad_request(response, request, e.what());
+    }
+  }
+
+  void denyDirectAuthPending(resp_https_t response, req_https_t request) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    try {
+      const auto input_tree = nlohmann::json::parse(request->content.string());
+      const auto pending_id = input_tree.value("pending_id", std::string());
+      if (pending_id.empty()) {
+        bad_request(response, request, "pending_id is required");
+        return;
+      }
+
+      const bool denied = nvhttp::direct_auth_deny_pending(pending_id);
+      send_response(response, {{"status", denied}, {"denied", denied}}, "no-store");
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "DenyDirectAuthPending: "sv << e.what();
+      bad_request(response, request, e.what());
+    }
+  }
+
+  void blockDirectAuthFingerprint(resp_https_t response, req_https_t request) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    try {
+      const auto input_tree = nlohmann::json::parse(request->content.string());
+      const auto fingerprint = input_tree.value("fingerprint", std::string());
+      if (fingerprint.empty()) {
+        bad_request(response, request, "fingerprint is required");
+        return;
+      }
+
+      const auto name = input_tree.value("name", std::string());
+      const auto uuid = input_tree.value("uuid", std::string());
+      const auto reason = input_tree.value("reason", std::string("denied"));
+      const bool blocked = nvhttp::direct_auth_block_fingerprint(fingerprint, reason, name, uuid);
+      send_response(response, {{"status", blocked}, {"blocked", blocked}}, "no-store");
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "BlockDirectAuthFingerprint: "sv << e.what();
+      bad_request(response, request, e.what());
+    }
+  }
+
+  void revokeDirectAuthFingerprint(resp_https_t response, req_https_t request) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    try {
+      const auto input_tree = nlohmann::json::parse(request->content.string());
+      const auto fingerprint = input_tree.value("fingerprint", std::string());
+      if (fingerprint.empty()) {
+        bad_request(response, request, "fingerprint is required");
+        return;
+      }
+
+      const bool revoked = nvhttp::direct_auth_revoke_fingerprint(fingerprint);
+      send_response(response, {{"status", revoked}, {"revoked", revoked}}, "no-store");
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "RevokeDirectAuthFingerprint: "sv << e.what();
+      bad_request(response, request, e.what());
+    }
+  }
+
+  void unblockDirectAuthFingerprint(resp_https_t response, req_https_t request) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    try {
+      const auto input_tree = nlohmann::json::parse(request->content.string());
+      const auto fingerprint = input_tree.value("fingerprint", std::string());
+      if (fingerprint.empty()) {
+        bad_request(response, request, "fingerprint is required");
+        return;
+      }
+
+      const bool unblocked = nvhttp::direct_auth_unblock_fingerprint(fingerprint);
+      send_response(response, {{"status", unblocked}, {"unblocked", unblocked}}, "no-store");
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "UnblockDirectAuthFingerprint: "sv << e.what();
+      bad_request(response, request, e.what());
+    }
+  }
+
   /**
    * @brief Get the configuration settings.
    * @param response The HTTP response object.
@@ -5803,6 +5962,14 @@ namespace confighttp {
     register_api_route("^/api/clients/update$", "POST", updateClient);
     register_api_route("^/api/clients/unpair$", "POST", unpair);
     register_api_route("^/api/clients/disconnect$", "POST", disconnectClient);
+    register_api_route("^/api/direct-auth/status$", "GET", getDirectAuth);
+    register_api_route("^/api/direct-auth/enrollment$", "POST", openDirectAuthEnrollment);
+    register_api_route("^/api/direct-auth/enrollment/close$", "POST", closeDirectAuthEnrollment);
+    register_api_route("^/api/direct-auth/pending/accept$", "POST", acceptDirectAuthPending);
+    register_api_route("^/api/direct-auth/pending/deny$", "POST", denyDirectAuthPending);
+    register_api_route("^/api/direct-auth/block$", "POST", blockDirectAuthFingerprint);
+    register_api_route("^/api/direct-auth/revoke$", "POST", revokeDirectAuthFingerprint);
+    register_api_route("^/api/direct-auth/unblock$", "POST", unblockDirectAuthFingerprint);
     register_api_route("^/api/apps/close$", "POST", closeApp);
     register_api_route("^/api/session/status$", "GET", getSessionStatus);
     register_api_route("^/api/host/stats$", "GET", getHostStats);

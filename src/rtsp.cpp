@@ -190,6 +190,7 @@ namespace rtsp_stream {
     snapshot->control_connect_data = control_connect_data;
     snapshot->unique_id = unique_id;
     snapshot->client_uuid = client_uuid;
+    snapshot->client_fingerprint = client_fingerprint;
     snapshot->device_name = device_name;
     snapshot->client_display_mode_override = client_display_mode_override;
     snapshot->client_display_refresh_millihz = client_display_refresh_millihz;

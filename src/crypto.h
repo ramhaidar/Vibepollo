@@ -139,6 +139,18 @@ namespace crypto {
   std::vector<uint8_t> sign256(const pkey_t &pkey, const std::string_view &data);
   bool verify256(const x509_t &x509, const std::string_view &data, const std::string_view &signature);
 
+  /**
+   * @brief SPKI SHA-256 fingerprint of an X.509 certificate.
+   *
+   * Normative encoding used by Vibe Direct Auth v1:
+   *   fingerprint = "sha256/" + base64url_no_padding(sha256(der(SubjectPublicKeyInfo)))
+   *
+   * The public key DER (SubjectPublicKeyInfo) is hashed, not the PEM text,
+   * certificate signature, serial, or CN.
+   */
+  std::string spki_sha256_fingerprint(const X509 *x509);
+  std::string spki_sha256_fingerprint(const x509_t &x509);
+
   creds_t gen_creds(const std::string_view &cn, std::uint32_t key_bits);
 
   std::string_view signature(const X509 *x);

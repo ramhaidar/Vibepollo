@@ -56,6 +56,7 @@ namespace rtsp_stream {
     std::string unique_id;
     std::string client_uuid;
     std::string client_name;
+    std::string client_fingerprint;
     std::optional<std::string> hdr_profile;
     crypto::PERM perm;
     int appid;

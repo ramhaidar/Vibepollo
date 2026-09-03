@@ -42,6 +42,7 @@
 
 // local includes
 #include "config.h"
+#include "direct_auth.h"
 #include "display_device.h"
 #include "display_helper_integration.h"
 #include "file_handler.h"
@@ -94,6 +95,15 @@ namespace nvhttp {
   struct client_t {
     std::vector<p_named_cert_t> named_devices;
   };
+
+  struct peer_auth_context_t {
+    std::string fingerprint;
+    std::string cert_pem;
+    bool valid_tls_cert {false};
+  };
+
+  thread_local peer_auth_context_t tl_peer_auth_context;
+  direct_auth::DirectAuthManager direct_auth_manager;
 
   struct pair_session_t;
 
@@ -1452,6 +1462,28 @@ namespace nvhttp {
 
       root["root"]["named_devices"] = named_cert_nodes;
 
+      {
+        nlohmann::json blocked_nodes = nlohmann::json::array();
+        const auto blocked = direct_auth_manager.snapshot_blocked();
+        for (const auto &info : blocked) {
+          nlohmann::json node = {
+            {"fingerprint", info.fingerprint},
+            {"reason", info.reason},
+            {"created_at_unix_ms", info.created_at_unix_ms},
+          };
+          if (!info.name.empty()) {
+            node["name"] = info.name;
+          }
+          if (!info.uuid.empty()) {
+            node["uuid"] = info.uuid;
+          }
+          blocked_nodes.push_back(std::move(node));
+        }
+        root["root"]["direct_auth"] = {
+          {"blocked_revoked", std::move(blocked_nodes)},
+        };
+      }
+
       if (file_handler::write_file(sunshine_path.c_str(), root.dump(4)) != 0) {
         BOOST_LOG(error) << "Couldn't write "sv << sunshine_path;
         return;
@@ -1633,6 +1665,25 @@ namespace nvhttp {
 
 
       {
+        std::vector<direct_auth::BlockedInfo> blocked;
+        if (root.contains("direct_auth") && root["direct_auth"].is_object() &&
+            root["direct_auth"].contains("blocked_revoked") && root["direct_auth"]["blocked_revoked"].is_array()) {
+          for (const auto &el : root["direct_auth"]["blocked_revoked"]) {
+            direct_auth::BlockedInfo info;
+            info.fingerprint = el.value("fingerprint", "");
+            if (direct_auth::DirectAuthManager::valid_fingerprint_format(info.fingerprint)) {
+              info.reason = el.value("reason", "denied");
+              info.name = el.value("name", "");
+              info.uuid = el.value("uuid", "");
+              info.created_at_unix_ms = el.value("created_at_unix_ms", std::int64_t {0});
+              blocked.push_back(std::move(info));
+            }
+          }
+        }
+        direct_auth_manager.load_blocked(blocked);
+      }
+
+      {
         std::lock_guard<std::mutex> lock(client_mutex);
         cert_chain.clear();
         for (auto &named_cert : client.named_devices) {
@@ -1749,6 +1800,332 @@ namespace nvhttp {
       }
 
       return it->second;
+    }
+
+    void reset_peer_auth_context() {
+      tl_peer_auth_context = {};
+    }
+
+    void store_peer_auth_context(const crypto::x509_t &cert) {
+      tl_peer_auth_context.fingerprint = cert ? crypto::spki_sha256_fingerprint(cert) : std::string();
+      tl_peer_auth_context.cert_pem = cert ? crypto::pem(const_cast<crypto::x509_t &>(cert)) : std::string();
+      tl_peer_auth_context.valid_tls_cert = cert != nullptr;
+    }
+
+    direct_auth::DeviceTrustState classify_current_peer() {
+      const auto &peer = tl_peer_auth_context;
+      if (!peer.valid_tls_cert || peer.fingerprint.empty()) {
+        return direct_auth::DeviceTrustState::Unknown;
+      }
+
+      const auto client = client_root_snapshot();
+      return direct_auth_manager.classify(peer.fingerprint, peer.cert_pem, [&](const std::string &cert_pem) {
+        return direct_auth::cert_matches_any_named_device(cert_pem, client.named_devices);
+      });
+    }
+
+    std::string current_peer_fingerprint() {
+      return tl_peer_auth_context.fingerprint;
+    }
+
+    std::string current_peer_cert_pem() {
+      return tl_peer_auth_context.cert_pem;
+    }
+
+    std::string current_peer_source_ip(req_https_t request) {
+      if (!request) {
+        return {};
+      }
+      const auto endpoint = request->remote_endpoint();
+      if (endpoint.address().is_unspecified()) {
+        return {};
+      }
+      return endpoint.address().to_string();
+    }
+
+    // Vibe Direct Auth v1 lets unknown-but-TLS-present devices reach only the
+    // dedicated enrollment endpoints. Trusted devices also retain their existing
+    // permission checks inside the Moonlight handlers.
+    bool is_direct_auth_public_path(std::string_view path) {
+      // The normative contract permits unknown certificates only on these three
+      // endpoints. /direct/v1/probe is trusted-only and must not be listed here.
+      return path == "/direct/v1/status" ||
+             path == "/direct/v1/enroll/request" ||
+             path == "/direct/v1/enroll/status";
+    }
+
+    bool direct_auth_requires_trusted(std::string_view path) {
+      if (path == "/serverinfo" || path == "/pair" || path == "/unpair") {
+        return false;
+      }
+      if (is_direct_auth_public_path(path)) {
+        return false;
+      }
+      return true;
+    }
+
+    void write_json_response(
+      resp_https_t response,
+      SimpleWeb::StatusCode status,
+      const nlohmann::json &body,
+      bool no_store = false
+    ) {
+      SimpleWeb::CaseInsensitiveMultimap headers;
+      headers.emplace("Content-Type", "application/json");
+      if (no_store) {
+        headers.emplace("Cache-Control", "no-store");
+      }
+      response->write(status, body.dump(), headers);
+      response->close_connection_after_response = true;
+    }
+
+    void write_unauthorized_json(resp_https_t response, const nlohmann::json &detail) {
+      nlohmann::json body {
+        {"ok", false},
+        {"error", "unauthorized"},
+        {"detail", detail},
+      };
+      write_json_response(response, SimpleWeb::StatusCode::client_error_unauthorized, body, true);
+    }
+
+    void write_direct_error(resp_https_t response, SimpleWeb::StatusCode status, const std::string &code, const std::string &message) {
+      nlohmann::json body {
+        {"protocol", 1},
+        {"error", {{"code", code}, {"message", message}}},
+      };
+      write_json_response(response, status, body, true);
+    }
+
+    std::string host_fingerprint_or_empty() {
+      if (conf_intern.servercert.empty()) {
+        return {};
+      }
+      auto host_x509 = crypto::x509(conf_intern.servercert);
+      if (!host_x509) {
+        return {};
+      }
+      return crypto::spki_sha256_fingerprint(host_x509);
+    }
+
+    std::string direct_auth_state_string(direct_auth::DeviceTrustState state) {
+      switch (state) {
+        case direct_auth::DeviceTrustState::Trusted:
+          return "trusted";
+        case direct_auth::DeviceTrustState::Blocked:
+          return "blocked";
+        case direct_auth::DeviceTrustState::Revoked:
+          return "revoked";
+        case direct_auth::DeviceTrustState::Unknown:
+        default:
+          return "unknown";
+      }
+    }
+
+    bool read_json_body(req_https_t request, nlohmann::json &body, std::string *error_code = nullptr) {
+      if (!request) {
+        if (error_code) *error_code = "MALFORMED";
+        return false;
+      }
+      if (request->content.size() > direct_auth::MAX_BODY_BYTES) {
+        if (error_code) *error_code = "BODY_TOO_LARGE";
+        return false;
+      }
+      try {
+        body = nlohmann::json::parse(request->content.string());
+      } catch (const std::exception &) {
+        if (error_code) *error_code = "MALFORMED";
+        return false;
+      }
+      if (!body.is_object()) {
+        if (error_code) *error_code = "MALFORMED";
+        return false;
+      }
+      if (body.value("protocol", 0) != 1) {
+        if (error_code) *error_code = "UNSUPPORTED_VERSION";
+        return false;
+      }
+      return true;
+    }
+
+    std::string direct_auth_setup_host(req_https_t request) {
+      // The setup link must use an endpoint the enrolling client can actually
+      // reach. The configured display name is not necessarily routable, so we
+      // prefer the peer-visible local endpoint address. Hostnames are returned
+      // unchanged for reverse-proxy deployments.
+      if (!request) {
+        return config::nvhttp.sunshine_name.empty() ? "localhost" : config::nvhttp.sunshine_name;
+      }
+      const auto local_endpoint = request->local_endpoint();
+      if (local_endpoint.address().is_unspecified()) {
+        return config::nvhttp.sunshine_name.empty() ? "localhost" : config::nvhttp.sunshine_name;
+      }
+      return net::addr_to_normalized_string(local_endpoint.address());
+    }
+
+    nlohmann::json direct_auth_status_payload(req_https_t request) {
+      const auto peer_fingerprint = current_peer_fingerprint();
+      const auto enrollment = direct_auth_manager.enrollment_status();
+
+      nlohmann::json enrollment_json = {
+        {"open", enrollment.state == direct_auth::EnrollmentState::Open},
+        {"enrollment_id", nullptr},
+        {"expires_at_unix_ms", nullptr},
+      };
+      if (enrollment.state == direct_auth::EnrollmentState::Open) {
+        enrollment_json["enrollment_id"] = enrollment.enrollment_id;
+        enrollment_json["expires_at_unix_ms"] = enrollment.expires_at_unix_ms;
+      }
+
+      return {
+        {"protocol", 1},
+        {"host_name", config::nvhttp.sunshine_name},
+        {"host_uuid", http::unique_id},
+        {"host_fingerprint", host_fingerprint_or_empty()},
+        {"client_fingerprint", peer_fingerprint},
+        {"auth_state", direct_auth_state_string(classify_current_peer())},
+        {"enrollment", enrollment_json},
+        {"legacy_pin_pairing_enabled", false},
+      };
+    }
+
+    void direct_auth_status(resp_https_t response, req_https_t request) {
+      direct_auth_manager.expire_stale();
+      write_json_response(response, SimpleWeb::StatusCode::success_ok, direct_auth_status_payload(request), true);
+    }
+
+    void direct_auth_probe(resp_https_t response, req_https_t request) {
+      if (classify_current_peer() != direct_auth::DeviceTrustState::Trusted) {
+        write_direct_error(response, SimpleWeb::StatusCode::client_error_forbidden, "UNAUTHORIZED", "Direct Auth probe requires a trusted client certificate.");
+        return;
+      }
+      const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+      ).count();
+      write_json_response(response, SimpleWeb::StatusCode::success_ok, {
+        {"protocol", 1},
+        {"ready", true},
+        {"host_uuid", http::unique_id},
+        {"host_fingerprint", host_fingerprint_or_empty()},
+        {"server_time_unix_ms", now_ms},
+      }, true);
+    }
+
+    void direct_auth_enroll_request(resp_https_t response, req_https_t request) {
+      nlohmann::json body;
+      std::string error_code;
+      if (!read_json_body(request, body, &error_code)) {
+        const auto &code = error_code == "BODY_TOO_LARGE" ? "BODY_TOO_LARGE" : "MALFORMED";
+        write_direct_error(response, SimpleWeb::StatusCode::client_error_bad_request, code, "Invalid Direct Auth request.");
+        return;
+      }
+
+      const auto actual_fingerprint = current_peer_fingerprint();
+      if (actual_fingerprint.empty()) {
+        write_direct_error(response, SimpleWeb::StatusCode::client_error_forbidden, "UNAUTHORIZED", "A client certificate is required.");
+        return;
+      }
+
+      const auto enrollment_id = body.value("enrollment_id", std::string());
+      const auto body_fingerprint = body.value("client_fingerprint", std::string());
+      const auto client_name = body.value("client_name", std::string());
+      const auto client_uuid = body.value("client_uuid", std::string());
+      const auto proof = body.value("proof", std::string());
+
+      if (!body.contains("enrollment_id") || !body.contains("client_fingerprint") ||
+          !body.contains("client_name") || !body.contains("client_uuid") || !body.contains("proof")) {
+        write_direct_error(response, SimpleWeb::StatusCode::client_error_bad_request, "MALFORMED", "Missing Direct Auth enrollment fields.");
+        return;
+      }
+
+      if (classify_current_peer() != direct_auth::DeviceTrustState::Unknown) {
+        // A blocked/revoked/trusted device cannot consume a public enrollment
+        // window. Blocked/revoked devices stay silent; trusted devices should
+        // use normal GameStream routes.
+        write_direct_error(response, SimpleWeb::StatusCode::client_error_forbidden, "UNAUTHORIZED", "Enrollment is only available to an unknown device.");
+        return;
+      }
+
+      std::string pending_id;
+      std::string manager_error;
+      const bool created = direct_auth_manager.submit_enrollment_request(
+        enrollment_id,
+        body_fingerprint,
+        client_name,
+        client_uuid,
+        proof,
+        actual_fingerprint,
+        current_peer_cert_pem(),
+        current_peer_source_ip(request),
+        &pending_id,
+        &manager_error
+      );
+
+      if (!created) {
+        const auto &code = manager_error.empty() ? "ENROLLMENT_INVALID_PROOF" : manager_error;
+        auto status = SimpleWeb::StatusCode::client_error_forbidden;
+        if (code == "ENROLLMENT_CLOSED") {
+          status = SimpleWeb::StatusCode::client_error_forbidden;
+        }
+        else if (code == "ENROLLMENT_PENDING" || code == "RATE_LIMITED") {
+          status = SimpleWeb::StatusCode::client_error_too_many_requests;
+        }
+        else if (code == "DEVICE_BLOCKED" || code == "DEVICE_REVOKED") {
+          status = SimpleWeb::StatusCode::client_error_forbidden;
+        }
+        // Unknown/expired/invalid proof all use a generic 400/403 response with
+        // the manager's exact machine-readable code where safe.
+        write_direct_error(response, status, code, "Enrollment was not created.");
+        return;
+      }
+
+      const auto pending = direct_auth_manager.pending_status(pending_id, actual_fingerprint);
+      write_json_response(response, SimpleWeb::StatusCode::success_ok, {
+        {"protocol", 1},
+        {"state", "pending"},
+        {"pending_id", pending.pending_id},
+        {"expires_at_unix_ms", pending.expires_at_unix_ms},
+      }, true);
+    }
+
+    void direct_auth_enroll_status(resp_https_t response, req_https_t request) {
+      auto args = request->parse_query_string();
+      const auto pending_id = get_arg(args, "pending_id", "");
+      if (pending_id.empty()) {
+        write_direct_error(response, SimpleWeb::StatusCode::client_error_bad_request, "MALFORMED", "Missing pending_id.");
+        return;
+      }
+
+      const auto fingerprint = current_peer_fingerprint();
+      if (fingerprint.empty()) {
+        write_direct_error(response, SimpleWeb::StatusCode::client_error_forbidden, "UNAUTHORIZED", "A client certificate is required.");
+        return;
+      }
+
+      const auto pending = direct_auth_manager.pending_status(pending_id, fingerprint);
+      std::string state;
+      switch (pending.state) {
+        case direct_auth::PendingState::Accepted:
+          state = "accepted";
+          break;
+        case direct_auth::PendingState::Denied:
+          state = "denied";
+          break;
+        case direct_auth::PendingState::Expired:
+          state = "expired";
+          break;
+        case direct_auth::PendingState::Pending:
+        default:
+          state = "pending";
+          break;
+      }
+      write_json_response(response, SimpleWeb::StatusCode::success_ok, {
+        {"protocol", 1},
+        {"state", state},
+      }, true);
+    }
+
+    void ensure_trusted_direct_state() {
+      direct_auth_manager.expire_stale();
     }
 
     std::mutex launch_request_mutex;
@@ -2953,6 +3330,15 @@ namespace nvhttp {
         nlohmann::json named_cert_node;
         named_cert_node["name"] = named_cert->name;
         named_cert_node["uuid"] = named_cert->uuid;
+        // Expose the fingerprint so the v2 Devices UI can show advanced device
+        // details and invoke Direct Auth revocation without disclosing cert PEMs.
+        if (!named_cert->cert.empty()) {
+          auto cert = crypto::x509(named_cert->cert);
+          const auto fingerprint = cert ? crypto::spki_sha256_fingerprint(cert) : std::string();
+          if (!fingerprint.empty()) {
+            named_cert_node["fingerprint"] = fingerprint;
+          }
+        }
         named_cert_node["display_mode"] = named_cert->display_mode;
         if (!named_cert->hdr_profile.empty()) {
           named_cert_node["hdr_profile"] = named_cert->hdr_profile;
@@ -4433,6 +4819,7 @@ namespace nvhttp {
     // Verify certificates after establishing connection
     https_server.verify = [](req_https_t req, SSL *ssl) {
       tl_peer_certificate.reset();
+      reset_peer_auth_context();
       forget_tls_client_identity(req);
 
       crypto::x509_t x509_verify {
@@ -4444,65 +4831,38 @@ namespace nvhttp {
       };
 
       if (!x509_verify) {
-        BOOST_LOG(info) << "unknown -- denied"sv;
+        BOOST_LOG(info) << "DirectAuth/Vibe HTTPS: missing client certificate -- denied";
         return false;
       }
 
-      bool verified = false;
-      p_named_cert_t named_cert_p;
-
-      auto fg = util::fail_guard([&]() {
-        const auto subject_name = cert_subject_name_for_log(x509_verify);
-        BOOST_LOG(verbose) << subject_name << " -- "sv << (verified ? "verified"sv : "denied"sv);
-      });
-
-      const char *err_str = nullptr;
-      {
-        std::lock_guard<std::mutex> lock(client_mutex);
-
-        if (pending_cert_queue) {
-          while (pending_cert_queue->peek()) {
-            auto cert = pending_cert_queue->pop();
-            if (!cert) {
-              continue;
-            }
-
-            const auto subject_name = cert_subject_name_for_log(cert);
-            BOOST_LOG(verbose) << "Added cert ["sv << subject_name << ']';
-
-            const auto pem = crypto::pem(cert);
-            auto named_it = std::find_if(
-              client_root.named_devices.begin(),
-              client_root.named_devices.end(),
-              [&pem](const p_named_cert_t &named_cert) {
-                return named_cert && named_cert->cert == pem;
-              }
-            );
-
-            if (named_it != client_root.named_devices.end()) {
-              cert_chain.add(*named_it);
-            } else {
-              BOOST_LOG(warning) << "Pending certificate not found in client registry: "sv << subject_name;
-            }
-          }
-        }
-
-        err_str = cert_chain.verify(x509_verify.get(), named_cert_p);
-
-      }
-      if (err_str) {
-        BOOST_LOG(warning) << "SSL Verification error :: "sv << err_str;
-        return verified;
+      // Vibe Direct Auth v1 accepts an unknown syntactically valid client
+      // certificate at the TLS layer so the request can reach the public
+      // /direct/v1 enrollment endpoints. Every other HTTPS route is gated in
+      // the handler by direct_auth trust state, which preserves the existing
+      // Moonlight authorization model.
+      const auto fingerprint = crypto::spki_sha256_fingerprint(x509_verify);
+      if (fingerprint.empty()) {
+        BOOST_LOG(warning) << "DirectAuth/Vibe HTTPS: unable to fingerprint client certificate -- denied";
+        return false;
       }
 
-      verified = true;
-      if (x509_verify) {
-        if (auto identity = resolve_client_identity_from_peer_cert(x509_verify)) {
-          remember_tls_client_identity(req, *identity);
-        }
-        tl_peer_certificate = std::move(x509_verify);
+      const auto subject_name = cert_subject_name_for_log(x509_verify);
+      const auto pem = crypto::pem(x509_verify);
+      if (pem.empty()) {
+        BOOST_LOG(warning) << subject_name << " -- unable to encode client certificate -- denied";
+        return false;
       }
 
+      store_peer_auth_context(x509_verify);
+
+      // Existing paired clients also get remembered by UUID for the legacy
+      // Moonlight handlers. Unknown clients are intentionally not remembered.
+      if (auto identity = resolve_client_identity_from_peer_cert(x509_verify)) {
+        remember_tls_client_identity(req, *identity);
+      }
+
+      tl_peer_certificate = std::move(x509_verify);
+      BOOST_LOG(verbose) << subject_name << " -- accepted for direct-auth route gating";
       return true;
     };
 
@@ -4541,6 +4901,20 @@ namespace nvhttp {
       run_on_blocking_pool(discovery_route_pool, std::move(task));
     };
 
+    // Route-aware Vibe Direct Auth v1 authorization. Direct public onboarding
+    // paths can be reached by unknown certificates; every other HTTPS route is
+    // trusted-only and gets a cheap DirectAuth 401 before entering Moonlight
+    // handlers (which retain their existing per-permission checks).
+    const auto direct_https_gate = [](const auto &handler) {
+      return [handler](resp_https_t response, req_https_t request) mutable {
+        if (classify_current_peer() != direct_auth::DeviceTrustState::Trusted) {
+          write_direct_error(response, SimpleWeb::StatusCode::client_error_forbidden, "UNAUTHORIZED", "This endpoint requires a trusted client certificate.");
+          return;
+        }
+        handler(std::move(response), std::move(request));
+      };
+    };
+
     https_server.default_resource["GET"] = not_found<SunshineHTTPS>;
     https_server.default_resource["POST"] = not_found<SunshineHTTPS>;
     https_server.resource["^/serverinfo$"]["GET"] = [run_discovery_nvhttp](auto resp, auto req) {
@@ -4552,13 +4926,31 @@ namespace nvhttp {
     https_server.resource["^/pair/?$"]["POST"] = pair<SunshineHTTPS>;
     https_server.resource["^/unpair/?$"]["GET"] = unpair<SunshineHTTPS>;
     https_server.resource["^/unpair/?$"]["POST"] = unpair<SunshineHTTPS>;
-    https_server.resource["^/applist$"]["GET"] = [run_discovery_nvhttp](auto resp, auto req) {
+    // Direct Auth endpoints must run inline on the HTTPS io thread: the TLS
+    // verify callback has already stored this connection's peer fingerprint in
+    // the thread-local peer-auth context, and dispatching to another worker pool
+    // would lose that context.
+    https_server.resource["^/direct/v1/status$"]["GET"] = [](auto resp, auto req) {
+      direct_auth_status(std::move(resp), std::move(req));
+    };
+    https_server.resource["^/direct/v1/probe$"]["GET"] = direct_https_gate([](resp_https_t resp, req_https_t req) {
+      direct_auth_probe(std::move(resp), std::move(req));
+    });
+    https_server.resource["^/direct/v1/enroll/request$"]["POST"] = [](auto resp, auto req) {
+      direct_auth_enroll_request(std::move(resp), std::move(req));
+    };
+    https_server.resource["^/direct/v1/enroll/status$"]["GET"] = [](auto resp, auto req) {
+      direct_auth_enroll_status(std::move(resp), std::move(req));
+    };
+    https_server.resource["^/applist$"]["GET"] = direct_https_gate([run_discovery_nvhttp](auto resp, auto req) {
       run_discovery_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
         applist(std::move(resp), std::move(req));
       });
-    };
-    https_server.resource["^/appasset$"]["GET"] = appasset;
-    https_server.resource["^/launch$"]["GET"] = [&host_audio, run_blocking_nvhttp](auto resp, auto req) {
+    });
+    https_server.resource["^/appasset$"]["GET"] = direct_https_gate([](auto resp, auto req) {
+      appasset(std::move(resp), std::move(req));
+    });
+    https_server.resource["^/launch$"]["GET"] = direct_https_gate([&host_audio, run_blocking_nvhttp](auto resp, auto req) {
       run_blocking_nvhttp([&host_audio, resp = std::move(resp), req = std::move(req)]() mutable {
         std::lock_guard launch_lock {launch_request_mutex};
         (void) proc::proc.running();
@@ -4566,8 +4958,8 @@ namespace nvhttp {
         const int current_appid = proc::proc.current_app_id();
         launch(host_audio, std::move(resp), std::move(req), current_appid);
       });
-    };
-    https_server.resource["^/resume$"]["GET"] = [&host_audio, run_blocking_nvhttp](auto resp, auto req) {
+    });
+    https_server.resource["^/resume$"]["GET"] = direct_https_gate([&host_audio, run_blocking_nvhttp](auto resp, auto req) {
       run_blocking_nvhttp([&host_audio, resp = std::move(resp), req = std::move(req)]() mutable {
         std::lock_guard launch_lock {launch_request_mutex};
         (void) proc::proc.running();
@@ -4575,17 +4967,25 @@ namespace nvhttp {
         const int current_appid = proc::proc.current_app_id();
         resume(host_audio, std::move(resp), std::move(req), current_appid);
       });
-    };
-    https_server.resource["^/cancel$"]["GET"] = [run_blocking_nvhttp](auto resp, auto req) {
+    });
+    https_server.resource["^/cancel$"]["GET"] = direct_https_gate([run_blocking_nvhttp](auto resp, auto req) {
       run_blocking_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
         std::lock_guard lock {launch_request_mutex};
         cancel(std::move(resp), std::move(req));
       });
-    };
-    https_server.resource["^/actions/clipboard$"]["GET"] = getClipboard;
-    https_server.resource["^/actions/clipboard$"]["POST"] = setClipboard;
-    https_server.resource["^/bitrate$"]["GET"] = setBitrate;
-    https_server.resource["^/api/abr/capabilities$"]["GET"] = getAbrCapabilities;
+    });
+    https_server.resource["^/actions/clipboard$"]["GET"] = direct_https_gate([](auto resp, auto req) {
+      getClipboard(std::move(resp), std::move(req));
+    });
+    https_server.resource["^/actions/clipboard$"]["POST"] = direct_https_gate([](auto resp, auto req) {
+      setClipboard(std::move(resp), std::move(req));
+    });
+    https_server.resource["^/bitrate$"]["GET"] = direct_https_gate([](auto resp, auto req) {
+      setBitrate(std::move(resp), std::move(req));
+    });
+    https_server.resource["^/api/abr/capabilities$"]["GET"] = direct_https_gate([](auto resp, auto req) {
+      getAbrCapabilities(std::move(resp), std::move(req));
+    });
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);
@@ -4915,5 +5315,187 @@ namespace nvhttp {
     }
 
     return removed;
+  }
+
+  direct_auth::DirectAuthManager &get_direct_auth_manager() {
+    return direct_auth_manager;
+  }
+
+  std::string host_fingerprint() {
+    return host_fingerprint_or_empty();
+  }
+
+  nlohmann::json direct_auth_admin_snapshot() {
+    direct_auth_manager.expire_stale();
+
+    nlohmann::json enrollment_json = {
+      {"open", false},
+      {"enrollment_id", nullptr},
+      {"expires_at_unix_ms", nullptr},
+      {"setup_uri", nullptr},
+    };
+
+    const auto enrollment = direct_auth_manager.enrollment_status();
+    if (enrollment.state == direct_auth::EnrollmentState::Open) {
+      enrollment_json["open"] = true;
+      enrollment_json["enrollment_id"] = enrollment.enrollment_id;
+      enrollment_json["expires_at_unix_ms"] = enrollment.expires_at_unix_ms;
+      enrollment_json["setup_uri"] = enrollment.setup_uri;
+    }
+
+    nlohmann::json pending_json = nlohmann::json::array();
+    for (const auto &pending : direct_auth_manager.pending_candidates()) {
+      pending_json.push_back({
+        {"pending_id", pending.pending_id},
+        {"fingerprint", pending.fingerprint},
+        {"name", pending.name},
+        {"uuid", pending.uuid},
+        {"source_ip", pending.source_ip},
+        {"created_at_unix_ms", pending.created_at_unix_ms},
+        {"expires_at_unix_ms", pending.expires_at_unix_ms},
+      });
+    }
+
+    nlohmann::json blocked_json = nlohmann::json::array();
+    for (const auto &blocked : direct_auth_manager.blocked_revoked()) {
+      blocked_json.push_back({
+        {"fingerprint", blocked.fingerprint},
+        {"reason", blocked.reason},
+        {"name", blocked.name},
+        {"uuid", blocked.uuid},
+        {"created_at_unix_ms", blocked.created_at_unix_ms},
+      });
+    }
+
+    return {
+      {"status", true},
+      {"enrollment", enrollment_json},
+      {"pending", pending_json},
+      {"blocked_revoked", blocked_json},
+      {"host_name", config::nvhttp.sunshine_name},
+      {"host_uuid", http::unique_id},
+      {"host_fingerprint", host_fingerprint()},
+    };
+  }
+
+  nlohmann::json direct_auth_open_enrollment(const std::string &host, std::uint16_t https_port, std::int64_t ttl_ms) {
+    if (host.empty() || https_port == 0) {
+      return {{"status", false}, {"error", "Missing host or https_port"}};
+    }
+
+    const auto enrollment = direct_auth_manager.open_enrollment(host, https_port, host_fingerprint(), ttl_ms);
+    nlohmann::json result = {
+      {"status", true},
+      {"enrollment", {
+        {"open", true},
+        {"enrollment_id", enrollment.enrollment_id},
+        {"expires_at_unix_ms", enrollment.expires_at_unix_ms},
+        {"setup_uri", enrollment.setup_uri},
+      }},
+    };
+    return result;
+  }
+
+  bool direct_auth_close_enrollment() {
+    direct_auth_manager.close_enrollment();
+    return true;
+  }
+
+  bool direct_auth_accept_pending(const std::string &pending_id) {
+    return direct_auth_manager.accept_pending(pending_id, [](const direct_auth::PendingInfo &info) {
+      auto named_cert_p = std::make_shared<crypto::named_cert_t>();
+      named_cert_p->name = info.name.empty() ? "Direct Auth Device" : info.name;
+      named_cert_p->uuid = info.uuid.empty() ? uuid_util::uuid_t::generate().string() : info.uuid;
+      named_cert_p->cert = info.cert_pem;
+      named_cert_p->display_mode = "";
+      named_cert_p->output_name_override.clear();
+      named_cert_p->perm = PERM::_default;
+      named_cert_p->enable_legacy_ordering = true;
+      named_cert_p->allow_client_commands = true;
+      named_cert_p->always_use_virtual_display = false;
+      named_cert_p->prefer_10bit_sdr = false;
+
+      {
+        std::lock_guard<std::mutex> lock(client_mutex);
+        if (client_root.named_devices.empty()) {
+          named_cert_p->perm = PERM::_all;
+        }
+      }
+
+      add_authorized_client(named_cert_p);
+      return true;
+    });
+  }
+
+  bool direct_auth_deny_pending(const std::string &pending_id) {
+    const bool denied = direct_auth_manager.deny_pending(pending_id, {});
+    if (denied && !config::sunshine.flags[config::flag::FRESH_STATE]) {
+      save_state();
+    }
+    return denied;
+  }
+
+  bool direct_auth_block_fingerprint(const std::string &fingerprint, const std::string &reason, const std::string &name, const std::string &uuid) {
+    if (fingerprint.empty()) {
+      return false;
+    }
+    direct_auth_manager.block_fingerprint(fingerprint, reason.empty() ? "denied" : reason, name, uuid);
+    if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
+      save_state();
+    }
+    return true;
+  }
+
+  bool direct_auth_revoke_fingerprint(const std::string &fingerprint) {
+    if (fingerprint.empty()) {
+      return false;
+    }
+
+    std::vector<std::string> disconnected_uuids;
+    {
+      std::lock_guard<std::mutex> lock(client_mutex);
+      for (auto it = client_root.named_devices.begin(); it != client_root.named_devices.end();) {
+        const auto &named_cert = *it;
+        if (!named_cert) {
+          ++it;
+          continue;
+        }
+        auto cert = crypto::x509(named_cert->cert);
+        const auto stored_fingerprint = cert ? crypto::spki_sha256_fingerprint(cert) : std::string();
+        if (!stored_fingerprint.empty() && stored_fingerprint == fingerprint) {
+          disconnected_uuids.push_back(named_cert->uuid);
+          it = client_root.named_devices.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+
+    direct_auth_manager.revoke_fingerprint(fingerprint);
+
+    if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
+      save_state();
+      load_state();
+    }
+
+    // Take the snapshot of active sessions before tearing down. The registry
+    // functions perform normal session teardown and must not be called while
+    // client_mutex is held.
+    for (const auto &uuid : disconnected_uuids) {
+      disconnect_client(uuid);
+    }
+
+    return true;
+  }
+
+  bool direct_auth_unblock_fingerprint(const std::string &fingerprint) {
+    if (fingerprint.empty()) {
+      return false;
+    }
+    direct_auth_manager.unblock_fingerprint(fingerprint);
+    if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
+      save_state();
+    }
+    return true;
   }
 }  // namespace nvhttp
