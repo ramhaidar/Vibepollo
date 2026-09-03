@@ -1,0 +1,657 @@
+# Vibepollo project-local mise configuration for Windows 11.
+# Place this file at the repository root as: mise.toml
+#
+# Design:
+# - mise pins Node/Python/uv/.NET used by the Windows build and tooling.
+# - The actual host compiler/CMake/Ninja/OpenSSL dependency universe MUST come from MSYS2 UCRT64.
+# - Do NOT use a standalone mise/MinGW GCC for Vibepollo.
+# - Visual Studio 2022 + Windows SDK are native prerequisites for the pinned WebRTC artifacts/toolchain.
+#
+# Verified against Nonary/Vibepollo master on 2026-09-02:
+# - Windows CI: windows-2022, MSYS2 UCRT64, GCC, CMake + Ninja.
+# - Node: 22.22.2.
+# - Python metadata: >=3.14.
+# - dotnet: 10.x for WiX-related tooling.
+# - WebRTC is enabled and uses pinned release artifacts.
+# - libvirtualdisplay CI package tag: v1.6.3.
+
+[tools]
+node = "22.22.2"
+python = "3.14.7"
+uv = "0.12.7"
+dotnet = "10"
+
+[env]
+VIBEPOLLO_MSYS2_ROOT = "{{config_root}}/.mise-tools/msys64"
+VIBEPOLLO_MSYS2_RELEASE = "20260611"
+VIBEPOLLO_MSYS2_SHA256 = "C105946E64E08F099AC0E4647461CE762B95333AD211777666476A9A41451D65"
+VIBEPOLLO_DEPS_DIR = "{{config_root}}/.vibepollo-deps"
+WEBRTC_ROOT = "{{config_root}}/.vibepollo-deps/libwebrtc/out"
+VDD_PREBUILT_PACKAGE_DIR = "{{config_root}}/.vibepollo-deps/libvirtualdisplay-release"
+VIBEPOLLO_LIBVIRTUALDISPLAY_TAG = "v1.6.3"
+MSYS2_PATH_TYPE = "minimal"
+
+
+# `mise install` normally installs only entries from [tools]. MSYS2 is a full
+# Windows userspace/toolchain distribution rather than a normal single-binary
+# mise tool, so provision it through a postinstall task. mise runs postinstall
+# even when all [tools] are already installed, making `mise install` the single
+# bootstrap command for this repository.
+# IMPORTANT: all pacman operations are intentionally serialized:
+# base -> update -> package install -> toolchain.
+[hooks]
+postinstall = { task = "bootstrap:toolchain" }
+
+[tasks."bootstrap:msys2-base"]
+description = "Provision a pinned portable MSYS2 base distribution without winget/system installation"
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+
+if (-not $IsWindows) {
+    throw "Portable MSYS2 bootstrap is Windows-only."
+}
+
+$root = $env:MISE_PROJECT_ROOT
+if ([string]::IsNullOrWhiteSpace($root)) { $root = (Get-Location).Path }
+
+$msysRoot = $env:VIBEPOLLO_MSYS2_ROOT
+$bash = Join-Path $msysRoot "usr\bin\bash.exe"
+
+if (Test-Path -LiteralPath $bash) {
+    Write-Host "MSYS2 base already present: $msysRoot"
+    exit 0
+}
+
+$toolsRoot = Split-Path $msysRoot -Parent
+New-Item -ItemType Directory -Force -Path $toolsRoot | Out-Null
+
+$release = $env:VIBEPOLLO_MSYS2_RELEASE
+$fileName = "msys2-base-x86_64-$release.sfx.exe"
+$url = "https://github.com/msys2/msys2-installer/releases/download/2026-06-11/$fileName"
+$expected = $env:VIBEPOLLO_MSYS2_SHA256.ToUpperInvariant()
+
+$tempDir = Join-Path ([IO.Path]::GetTempPath()) ("vibepollo-msys2-" + [guid]::NewGuid().ToString("N"))
+$archive = Join-Path $tempDir $fileName
+New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+
+try {
+    Write-Host "Downloading pinned MSYS2 $release from official msys2/msys2-installer release..."
+    Invoke-WebRequest -Uri $url -OutFile $archive
+
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToUpperInvariant()
+    if ($actual -ne $expected) {
+        throw "MSYS2 SHA-256 mismatch. Expected $expected but got $actual. Refusing extraction."
+    }
+
+    Write-Host "SHA-256 verified."
+    Write-Host "Extracting portable MSYS2 under: $toolsRoot"
+
+    & $archive "-y" "-o$toolsRoot"
+    if ($LASTEXITCODE -ne 0) {
+        throw "MSYS2 self-extracting archive failed with exit code $LASTEXITCODE"
+    }
+
+    if (-not (Test-Path -LiteralPath $bash)) {
+        throw "MSYS2 archive extracted, but expected bash was not found at $bash"
+    }
+
+    $env:MSYSTEM = "UCRT64"
+    $env:CHERE_INVOKING = "1"
+    $env:MSYS2_PATH_TYPE = "minimal"
+    & $bash -lc 'exit 0'
+    if ($LASTEXITCODE -ne 0) {
+        throw "Initial MSYS2 login shell failed with exit code $LASTEXITCODE"
+    }
+
+    Write-Host "Portable MSYS2 ready: $msysRoot"
+}
+finally {
+    Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+'''
+
+[tasks."bootstrap:msys2-update"]
+description = "Update the portable MSYS2 base before installing UCRT64 development packages"
+depends = ["bootstrap:msys2-base"]
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+
+$bash = Join-Path $env:VIBEPOLLO_MSYS2_ROOT "usr\bin\bash.exe"
+if (-not (Test-Path -LiteralPath $bash)) {
+    throw "MSYS2 bash not found after bootstrap."
+}
+
+$env:MSYSTEM = "UCRT64"
+$env:CHERE_INVOKING = "1"
+$env:MSYS2_PATH_TYPE = "minimal"
+
+# Recover only a stale lock belonging to this project-local MSYS2.
+$lockFile = Join-Path $env:VIBEPOLLO_MSYS2_ROOT "var\lib\pacman\db.lck"
+$localPacman = Get-CimInstance Win32_Process -Filter "Name = 'pacman.exe'" -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.ExecutablePath -and
+        $_.ExecutablePath.StartsWith($env:VIBEPOLLO_MSYS2_ROOT, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+if ((Test-Path -LiteralPath $lockFile) -and -not $localPacman) {
+    Write-Warning "Removing stale project-local pacman lock: $lockFile"
+    Remove-Item -LiteralPath $lockFile -Force
+}
+
+if ($localPacman) {
+    throw "A project-local pacman process is already running. Refusing concurrent package operations."
+}
+
+& $bash -lc 'pacman -Syu --noconfirm'
+if ($LASTEXITCODE -ne 0) {
+    throw "Initial MSYS2 pacman -Syu failed with exit code $LASTEXITCODE"
+}
+
+& $bash -lc 'pacman -Su --noconfirm'
+if ($LASTEXITCODE -ne 0) {
+    throw "Second MSYS2 pacman -Su pass failed with exit code $LASTEXITCODE"
+}
+'''
+
+[tasks."bootstrap:toolchain"]
+description = "Provision portable MSYS2 and install/update the Vibepollo UCRT64 toolchain"
+depends = ["bootstrap:msys2"]
+shell = "pwsh -NoProfile -Command"
+run = "Write-Host 'Vibepollo portable MSYS2/UCRT64 toolchain is provisioned.'"
+
+[tasks.doctor]
+description = "Validate Vibepollo's Windows/MSYS2 UCRT64/WebRTC build environment"
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+
+if (-not $IsWindows) {
+    throw "This project configuration is intended for Windows."
+}
+
+$root = $env:MISE_PROJECT_ROOT
+if ([string]::IsNullOrWhiteSpace($root)) { $root = (Get-Location).Path }
+
+Write-Host "== Vibepollo doctor =="
+
+Write-Host "[check] mise-pinned tools"
+node --version
+if ($LASTEXITCODE -ne 0) { throw "node unavailable" }
+$nodeVersion = (node --version).TrimStart("v")
+if ($nodeVersion -ne "22.22.2") {
+    throw "Expected Node 22.22.2 for current Vibepollo Windows CI; got $nodeVersion"
+}
+
+python --version
+dotnet --version
+
+Write-Host "[check] Git/submodules"
+git --version
+$submoduleLines = @(git submodule status --recursive)
+if ($LASTEXITCODE -ne 0) { throw "Unable to inspect submodules" }
+$badSubmodules = @($submoduleLines | Where-Object { $_ -match '^[+-]' })
+if ($badSubmodules.Count -gt 0) {
+    Write-Warning "Some submodules are missing or not at the recorded commit. Run: mise run bootstrap:submodules"
+    $badSubmodules | ForEach-Object { Write-Host "  $_" }
+}
+
+Write-Host "[check] MSYS2 UCRT64"
+$msysRoot = $env:VIBEPOLLO_MSYS2_ROOT
+$bash = Join-Path $msysRoot "usr\bin\bash.exe"
+if (-not (Test-Path -LiteralPath $bash)) {
+    throw "MSYS2 was not found at $msysRoot. Install MSYS2 or override VIBEPOLLO_MSYS2_ROOT in mise.local.toml."
+}
+
+$env:MSYSTEM = "UCRT64"
+$env:CHERE_INVOKING = "1"
+$env:MSYS2_PATH_TYPE = "minimal"
+
+& $bash -lc @'
+set -euo pipefail
+echo "MSYSTEM=${MSYSTEM:-}"
+for cmd in gcc g++ cmake ninja openssl pkg-config; do
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "[missing] $cmd" >&2
+    exit 10
+  fi
+  echo "[found] $cmd -> $(command -v "$cmd")"
+  "$cmd" --version 2>&1 | head -n 1 || true
+done
+case "$(command -v gcc)" in
+  /ucrt64/bin/gcc) ;;
+  *)
+    echo "Wrong GCC selected: $(command -v gcc). Vibepollo must use /ucrt64/bin/gcc." >&2
+    exit 11
+    ;;
+esac
+'@
+if ($LASTEXITCODE -ne 0) {
+    throw "MSYS2 UCRT64 toolchain validation failed with exit code $LASTEXITCODE"
+}
+
+Write-Host "[check] Visual Studio 2022 for WebRTC"
+$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path -LiteralPath $vswhere)) {
+    throw "vswhere.exe not found"
+}
+$vs2022 = (& $vswhere -latest -products * -version "[17.0,18.0)" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+if ([string]::IsNullOrWhiteSpace($vs2022)) {
+    throw "Visual Studio 2022 with MSVC x86/x64 tools was not found. Vibepollo Windows CI is based on windows-2022."
+}
+Write-Host "  $vs2022"
+
+Write-Host "[check] Windows SDK"
+$kitsRoot = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Name KitsRoot10 -ErrorAction Stop).KitsRoot10
+if ([string]::IsNullOrWhiteSpace($kitsRoot) -or -not (Test-Path -LiteralPath $kitsRoot)) {
+    throw "Windows SDK KitsRoot10 was not found."
+}
+Write-Host "  $kitsRoot"
+
+Write-Host "[check] Pinned WebRTC artifact"
+$webrtcDll = Join-Path $env:WEBRTC_ROOT "lib\libwebrtc.dll"
+$webrtcImport = Join-Path $env:WEBRTC_ROOT "lib\libwebrtc.dll.a"
+$webrtcHeader = Join-Path $env:WEBRTC_ROOT "include\libwebrtc.h"
+if (-not ((Test-Path $webrtcDll) -and (Test-Path $webrtcImport) -and (Test-Path $webrtcHeader))) {
+    Write-Warning "Pinned WebRTC artifact is not staged. Run: mise run bootstrap:artifacts"
+}
+
+Write-Host "[check] libvirtualdisplay prebuilt artifact"
+$vddInf = Join-Path $env:VDD_PREBUILT_PACKAGE_DIR "driver\SunshineVirtualDisplayDriver.inf"
+if (-not (Test-Path $vddInf)) {
+    Write-Warning "libvirtualdisplay release payload is not staged. Run: mise run bootstrap:artifacts"
+}
+
+Write-Host "[ok] Vibepollo environment looks usable."
+'''
+
+[tasks."bootstrap:msys2"]
+description = "Install the exact MSYS2 UCRT64 dependency family used by Vibepollo Windows CI"
+depends = ["bootstrap:msys2-update"]
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+
+$msysRoot = $env:VIBEPOLLO_MSYS2_ROOT
+$bash = Join-Path $msysRoot "usr\bin\bash.exe"
+if (-not (Test-Path -LiteralPath $bash)) {
+    throw "MSYS2 not found at $msysRoot. Install MSYS2 first or override VIBEPOLLO_MSYS2_ROOT."
+}
+
+$env:MSYSTEM = "UCRT64"
+$env:CHERE_INVOKING = "1"
+$env:MSYS2_PATH_TYPE = "minimal"
+
+$lockFile = Join-Path $env:VIBEPOLLO_MSYS2_ROOT "var\lib\pacman\db.lck"
+$localPacman = Get-CimInstance Win32_Process -Filter "Name = 'pacman.exe'" -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.ExecutablePath -and
+        $_.ExecutablePath.StartsWith($env:VIBEPOLLO_MSYS2_ROOT, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+if ((Test-Path -LiteralPath $lockFile) -and -not $localPacman) {
+    Write-Warning "Removing stale project-local pacman lock: $lockFile"
+    Remove-Item -LiteralPath $lockFile -Force
+}
+
+if ($localPacman) {
+    throw "A project-local pacman process is already running. Refusing concurrent package operations."
+}
+
+$packages = @(
+    "git",
+    "mingw-w64-ucrt-x86_64-boost",
+    "mingw-w64-ucrt-x86_64-cmake",
+    "mingw-w64-ucrt-x86_64-cppwinrt",
+    "mingw-w64-ucrt-x86_64-curl-winssl",
+    "mingw-w64-ucrt-x86_64-gcc",
+    "mingw-w64-ucrt-x86_64-MinHook",
+    "mingw-w64-ucrt-x86_64-miniupnpc",
+    "mingw-w64-ucrt-x86_64-ninja",
+    "mingw-w64-ucrt-x86_64-nlohmann-json",
+    "mingw-w64-ucrt-x86_64-onevpl",
+    "mingw-w64-ucrt-x86_64-openssl",
+    "mingw-w64-ucrt-x86_64-opus",
+    "mingw-w64-ucrt-x86_64-sqlite3",
+    "mingw-w64-ucrt-x86_64-tools"
+)
+
+$quoted = ($packages | ForEach-Object { "'$_'" }) -join " "
+& $bash -lc "set -euo pipefail; pacman -S --needed --noconfirm $quoted"
+if ($LASTEXITCODE -ne 0) {
+    throw "pacman dependency installation failed with exit code $LASTEXITCODE"
+}
+'''
+
+[tasks."bootstrap:submodules"]
+description = "Initialize all Vibepollo recursive git submodules"
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+
+git config --local core.longpaths true
+
+$exclude = Join-Path $env:MISE_PROJECT_ROOT ".git\info\exclude"
+if (Test-Path -LiteralPath (Split-Path $exclude -Parent)) {
+    $existing = if (Test-Path $exclude) { Get-Content $exclude } else { @() }
+    foreach ($line in @(".mise-tools/", ".vibepollo-deps/", ".venv/", "build-mise-dev/")) {
+        if ($existing -notcontains $line) {
+            Add-Content -LiteralPath $exclude -Value $line
+        }
+    }
+}
+
+git submodule update --init --recursive
+if ($LASTEXITCODE -ne 0) {
+    throw "git submodule update failed"
+}
+'''
+
+[tasks."bootstrap:python"]
+description = "Create a project-local Python tooling venv for Vibepollo lint/locale helpers"
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+
+$venv = Join-Path $env:MISE_PROJECT_ROOT ".venv"
+$python = Join-Path $venv "Scripts\python.exe"
+
+if (-not (Test-Path -LiteralPath $python)) {
+    uv venv --python 3.14 $venv
+    if ($LASTEXITCODE -ne 0) { throw "uv venv failed" }
+}
+
+uv pip install --python $python `
+    "clang-format==20.*" `
+    "flake8==7.3.0" `
+    "Babel==2.18.0" `
+    setuptools `
+    wheel
+
+if ($LASTEXITCODE -ne 0) { throw "Python tooling install failed" }
+'''
+
+[tasks."bootstrap:artifacts"]
+description = "Download and SHA-verify pinned WebRTC plus libvirtualdisplay Windows artifacts"
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+
+New-Item -ItemType Directory -Force -Path $env:VIBEPOLLO_DEPS_DIR | Out-Null
+
+& (Join-Path $env:MISE_PROJECT_ROOT "scripts\download_webrtc_release.ps1") `
+    -ManifestPath (Join-Path $env:MISE_PROJECT_ROOT "third-party\webrtc-artifacts\windows-x64.json") `
+    -OutDir $env:WEBRTC_ROOT
+if ($LASTEXITCODE -ne 0) { throw "Pinned WebRTC download failed" }
+
+& (Join-Path $env:MISE_PROJECT_ROOT "scripts\download_libvirtualdisplay_release.ps1") `
+    -Repository "Nonary/libvirtualdisplay" `
+    -Tag $env:VIBEPOLLO_LIBVIRTUALDISPLAY_TAG `
+    -OutDir $env:VDD_PREBUILT_PACKAGE_DIR
+if ($LASTEXITCODE -ne 0) { throw "libvirtualdisplay download failed" }
+'''
+
+[tasks.bootstrap]
+description = "Prepare submodules, MSYS2 packages, Python tools, and pinned binary artifacts"
+run = [
+    { task = "bootstrap:submodules" },
+    { task = "bootstrap:toolchain" },
+    { task = "bootstrap:python" },
+    { task = "bootstrap:artifacts" },
+]
+
+[tasks.build]
+description = "CI-like Windows Release build with tests enabled, WebRTC enabled, and prebuilt VDD payload"
+depends = ["doctor"]
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+
+$msysRoot = $env:VIBEPOLLO_MSYS2_ROOT
+$bash = Join-Path $msysRoot "usr\bin\bash.exe"
+$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+
+$vs2022 = (& $vswhere -latest -products * -version "[17.0,18.0)" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+if ([string]::IsNullOrWhiteSpace($vs2022)) { throw "Visual Studio 2022 MSVC toolchain not found" }
+
+$kitsRoot = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Name KitsRoot10 -ErrorAction Stop).KitsRoot10
+$nodeBinary = (Get-Command node -ErrorAction Stop).Source
+
+$env:MSYSTEM = "UCRT64"
+$env:CHERE_INVOKING = "1"
+$env:MSYS2_PATH_TYPE = "minimal"
+$env:NODEJS_PATH = Split-Path $nodeBinary -Parent
+$env:WEBRTC_VS_PATH = $vs2022
+$env:WEBRTC_WINSDK_DIR = $kitsRoot
+$env:WEBRTC_MSYS2_BIN = Join-Path $msysRoot "ucrt64\bin"
+$env:BRANCH = (git branch --show-current)
+$env:COMMIT = (git rev-parse HEAD)
+$env:BUILD_VERSION = "0.0.0-dev"
+
+& $bash -lc @'
+set -euo pipefail
+
+case "$(command -v gcc)" in
+  /ucrt64/bin/gcc) ;;
+  *)
+    echo "Refusing build with non-UCRT64 GCC: $(command -v gcc)" >&2
+    exit 20
+    ;;
+esac
+
+NODEJS_PATH="$(cygpath -u "$NODEJS_PATH")"
+export PATH="${NODEJS_PATH}:$PATH"
+NPM_PATH="$(cygpath -m "${NODEJS_PATH}/npm.cmd")"
+
+echo "GCC: $(command -v gcc)"
+echo "CMake: $(command -v cmake)"
+echo "Ninja: $(command -v ninja)"
+echo "Node: $(command -v node) ($(node --version))"
+
+cmake \
+  -B build \
+  -G Ninja \
+  -S . \
+  -DBUILD_WERROR=ON \
+  -DBUILD_TESTS=ON \
+  -DBUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER=OFF \
+  -DBUILD_VIRTUALDISPLAY_PROBE=OFF \
+  -DBUILD_VIRTUALDISPLAY_TOOLS=OFF \
+  -DBUILD_VIRTUALDISPLAY_VULKAN_LAYER=OFF \
+  -DBUILD_DOCS=OFF \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSUNSHINE_ENABLE_WEBRTC=ON \
+  -DWEBRTC_ROOT="$(cygpath -u "$WEBRTC_ROOT")" \
+  -DWEBRTC_INCLUDE_DIR="$(cygpath -u "$WEBRTC_ROOT")/include" \
+  -DWEBRTC_LIBRARY="$(cygpath -u "$WEBRTC_ROOT")/lib/libwebrtc.dll.a" \
+  -DWEBRTC_MSYS2_BIN="$(cygpath -u "$WEBRTC_MSYS2_BIN")" \
+  -DWEBRTC_VS_PATH="$(cygpath -u "$WEBRTC_VS_PATH")" \
+  -DWEBRTC_WINSDK_DIR="$(cygpath -u "$WEBRTC_WINSDK_DIR")" \
+  -DSUNSHINE_NPM_EXECUTABLE="${NPM_PATH}" \
+  -DSUNSHINE_LIBVIRTUALDISPLAY_PREBUILT_DIR="$(cygpath -u "$VDD_PREBUILT_PACKAGE_DIR")" \
+  -DSUNSHINE_ASSETS_DIR=assets \
+  -DSUNSHINE_PUBLISHER_NAME=LocalDevelopment \
+  -DSUNSHINE_PUBLISHER_WEBSITE=https://github.com/Nonary/Vibepollo \
+  -DSUNSHINE_PUBLISHER_ISSUE_URL=https://github.com/Nonary/Vibepollo/issues
+
+cmake --build build --target all -j "$(nproc)"
+'@
+if ($LASTEXITCODE -ne 0) {
+    throw "Vibepollo build failed with exit code $LASTEXITCODE"
+}
+'''
+
+[tasks."build:dev"]
+description = "RelWithDebInfo developer build in build-mise-dev, preserving the CI toolchain contract"
+depends = ["doctor"]
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+
+$msysRoot = $env:VIBEPOLLO_MSYS2_ROOT
+$bash = Join-Path $msysRoot "usr\bin\bash.exe"
+$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+
+$vs2022 = (& $vswhere -latest -products * -version "[17.0,18.0)" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1)
+if ([string]::IsNullOrWhiteSpace($vs2022)) { throw "Visual Studio 2022 MSVC toolchain not found" }
+
+$kitsRoot = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" -Name KitsRoot10 -ErrorAction Stop).KitsRoot10
+$nodeBinary = (Get-Command node -ErrorAction Stop).Source
+
+$env:MSYSTEM = "UCRT64"
+$env:CHERE_INVOKING = "1"
+$env:MSYS2_PATH_TYPE = "minimal"
+$env:NODEJS_PATH = Split-Path $nodeBinary -Parent
+$env:WEBRTC_VS_PATH = $vs2022
+$env:WEBRTC_WINSDK_DIR = $kitsRoot
+$env:WEBRTC_MSYS2_BIN = Join-Path $msysRoot "ucrt64\bin"
+$env:BRANCH = (git branch --show-current)
+$env:COMMIT = (git rev-parse HEAD)
+$env:BUILD_VERSION = "0.0.0-dev"
+
+& $bash -lc @'
+set -euo pipefail
+case "$(command -v gcc)" in
+  /ucrt64/bin/gcc) ;;
+  *) echo "Wrong GCC: $(command -v gcc)" >&2; exit 20 ;;
+esac
+
+NODEJS_PATH="$(cygpath -u "$NODEJS_PATH")"
+export PATH="${NODEJS_PATH}:$PATH"
+NPM_PATH="$(cygpath -m "${NODEJS_PATH}/npm.cmd")"
+
+cmake \
+  -B build-mise-dev \
+  -G Ninja \
+  -S . \
+  -DBUILD_WERROR=ON \
+  -DBUILD_TESTS=ON \
+  -DBUILD_SUNSHINE_VIRTUAL_DISPLAY_DRIVER=OFF \
+  -DBUILD_VIRTUALDISPLAY_PROBE=OFF \
+  -DBUILD_VIRTUALDISPLAY_TOOLS=OFF \
+  -DBUILD_VIRTUALDISPLAY_VULKAN_LAYER=OFF \
+  -DBUILD_DOCS=OFF \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DSUNSHINE_ENABLE_WEBRTC=ON \
+  -DWEBRTC_ROOT="$(cygpath -u "$WEBRTC_ROOT")" \
+  -DWEBRTC_INCLUDE_DIR="$(cygpath -u "$WEBRTC_ROOT")/include" \
+  -DWEBRTC_LIBRARY="$(cygpath -u "$WEBRTC_ROOT")/lib/libwebrtc.dll.a" \
+  -DWEBRTC_MSYS2_BIN="$(cygpath -u "$WEBRTC_MSYS2_BIN")" \
+  -DWEBRTC_VS_PATH="$(cygpath -u "$WEBRTC_VS_PATH")" \
+  -DWEBRTC_WINSDK_DIR="$(cygpath -u "$WEBRTC_WINSDK_DIR")" \
+  -DSUNSHINE_NPM_EXECUTABLE="${NPM_PATH}" \
+  -DSUNSHINE_LIBVIRTUALDISPLAY_PREBUILT_DIR="$(cygpath -u "$VDD_PREBUILT_PACKAGE_DIR")" \
+  -DSUNSHINE_ASSETS_DIR=assets \
+  -DSUNSHINE_PUBLISHER_NAME=LocalDevelopment \
+  -DSUNSHINE_PUBLISHER_WEBSITE=https://github.com/Nonary/Vibepollo \
+  -DSUNSHINE_PUBLISHER_ISSUE_URL=https://github.com/Nonary/Vibepollo/issues
+
+cmake --build build-mise-dev --target all -j "$(nproc)"
+'@
+if ($LASTEXITCODE -ne 0) {
+    throw "Vibepollo developer build failed with exit code $LASTEXITCODE"
+}
+'''
+
+[tasks.test]
+description = "Run CTest from the CI-like build tree"
+depends = ["build"]
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+
+$msysRoot = $env:VIBEPOLLO_MSYS2_ROOT
+$bash = Join-Path $msysRoot "usr\bin\bash.exe"
+$env:MSYSTEM = "UCRT64"
+$env:CHERE_INVOKING = "1"
+$env:MSYS2_PATH_TYPE = "minimal"
+
+& $bash -lc 'set -euo pipefail; ctest --test-dir build --output-on-failure -j "$(nproc)"'
+if ($LASTEXITCODE -ne 0) {
+    throw "CTest failed with exit code $LASTEXITCODE"
+}
+'''
+
+[tasks."test:amf"]
+description = "Run the standalone native AMF lifecycle test mirrored from Windows CI"
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+
+$msysRoot = $env:VIBEPOLLO_MSYS2_ROOT
+$bash = Join-Path $msysRoot "usr\bin\bash.exe"
+$env:MSYSTEM = "UCRT64"
+$env:CHERE_INVOKING = "1"
+$env:MSYS2_PATH_TYPE = "minimal"
+
+& $bash -lc @'
+set -euo pipefail
+mkdir -p build
+c++ \
+  -std=gnu++23 \
+  -O2 \
+  -pthread \
+  -DSUNSHINE_AMF_LIFECYCLE_STANDALONE \
+  -I. \
+  tests/unit/platform/windows/test_native_amf_review.cpp \
+  -o build/native-amf-lifecycle-test.exe
+./build/native-amf-lifecycle-test.exe
+'@
+if ($LASTEXITCODE -ne 0) {
+    throw "Native AMF lifecycle test failed with exit code $LASTEXITCODE"
+}
+'''
+
+[tasks.verify]
+description = "Build and run the automated test suite"
+run = [
+    { task = "test" },
+    { task = "test:amf" },
+]
+
+[tasks.baseline]
+description = "Bootstrap all local dependencies, validate, build, and test unmodified Vibepollo"
+run = [
+    { task = "bootstrap" },
+    { task = "doctor" },
+    { task = "verify" },
+]
+
+[tasks.clean]
+description = "Remove local Vibepollo build trees only"
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+foreach ($name in @("build", "build-mise-dev")) {
+    $path = Join-Path $env:MISE_PROJECT_ROOT $name
+    if (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Recurse -Force
+        Write-Host "Cleaned $path"
+    }
+}
+'''
+
+[tasks.status]
+description = "Show repository and toolchain state useful for coding-agent diagnostics"
+shell = "pwsh -NoProfile -Command"
+run = '''
+$ErrorActionPreference = "Stop"
+
+Write-Host "== git status =="
+git status --short --branch
+
+Write-Host ""
+Write-Host "== submodules =="
+git submodule status --recursive
+
+Write-Host ""
+Write-Host "== mise =="
+mise current
+
+Write-Host ""
+Write-Host "== native prerequisites =="
+Write-Host "MSYS2 root: $env:VIBEPOLLO_MSYS2_ROOT"
+Write-Host "WebRTC root: $env:WEBRTC_ROOT"
+Write-Host "VDD package: $env:VDD_PREBUILT_PACKAGE_DIR"
+'''
