@@ -1,5 +1,6 @@
 # Prerequisites
 *.d
+*.tmp
 
 # Compiled Object files
 *.slo
@@ -61,6 +62,7 @@ package-lock.json
 # Python
 *.pyc
 venv/
+.venv/
 _codeql_detected_source_root
 
 build-msvc
@@ -75,3 +77,12 @@ AGENTS.md
 test_sunshine.log
 vibeshine_state.json
 .claude/
+credentials/
+*.key
+*.pem
+
+# mise local environment & dependencies
+.mise-tools/
+.vibepollo-deps/
+mise.local.toml
+.mise.local.toml
