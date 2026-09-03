@@ -14,6 +14,8 @@
 #include <string_view>
 
 // lib includes
+#include <boost/asio/ip/address.hpp>
+#include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
@@ -47,6 +49,21 @@ namespace direct_auth {
     }
   }  // namespace
 
+  DirectAuthManager::DirectAuthManager():
+      DirectAuthManager([](const std::size_t bytes, std::string &out) {
+        return crypto::secure_random_bytes(bytes, out);
+      }) {
+  }
+
+  DirectAuthManager::DirectAuthManager(RandomBytesProvider random_bytes_provider):
+      random_bytes_provider_(std::move(random_bytes_provider)) {
+    if (!random_bytes_provider_) {
+      random_bytes_provider_ = [](const std::size_t bytes, std::string &out) {
+        return crypto::secure_random_bytes(bytes, out);
+      };
+    }
+  }
+
   std::string DirectAuthManager::base64url_encode(const std::string_view &bytes) {
     static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     std::string out;
@@ -73,6 +90,13 @@ namespace direct_auth {
       return true;
     }
 
+    if (input.find('=') != std::string_view::npos ||
+        input.find('+') != std::string_view::npos ||
+        input.find('/') != std::string_view::npos ||
+        input.size() % 4 == 1) {
+      return false;
+    }
+
     auto valid_char = [](char c) -> int {
       if (c >= 'A' && c <= 'Z') return c - 'A';
       if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -82,18 +106,7 @@ namespace direct_auth {
       return -1;
     };
 
-    std::size_t padding = 0;
-    if (input.back() == '=') {
-      padding = 1;
-      if (input.size() > 1 && input[input.size() - 2] == '=') {
-        padding = 2;
-      }
-    }
-
-    const std::size_t data_len = input.size() - padding;
-    if (data_len % 4 == 1) {
-      return false;
-    }
+    const std::size_t data_len = input.size();
 
     out.reserve((data_len / 4) * 3 + (data_len % 4 == 2 ? 1 : data_len % 4 == 3 ? 2 : 0));
     std::array<int, 4> buf {};
@@ -118,6 +131,10 @@ namespace direct_auth {
       out.push_back(static_cast<char>((buf[0] << 2) | (buf[1] >> 4)));
       out.push_back(static_cast<char>(((buf[1] & 0x0F) << 4) | (buf[2] >> 2)));
     } else if (group != 0) {
+      out.clear();
+      return false;
+    }
+    if (base64url_encode(out) != input) {
       out.clear();
       return false;
     }
@@ -163,35 +180,244 @@ namespace direct_auth {
   }
 
   bool DirectAuthManager::valid_fingerprint_format(const std::string_view &fp) {
-    if (fp.size() <= 8 || fp.substr(0, 7) != "sha256/") {
+    if (fp.size() != 7 + 43 || fp.substr(0, 7) != "sha256/") {
       return false;
     }
-    for (std::size_t i = 7; i < fp.size(); ++i) {
-      const char c = fp[i];
-      if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
-        return false;
-      }
-    }
-    // SHA-256 base64url no padding is exactly 43 characters.
-    return fp.size() == 7 + 43;
+    std::string digest;
+    return base64url_decode(fp.substr(7), digest) && digest.size() == 32;
   }
 
   bool DirectAuthManager::valid_enrollment_id_format(const std::string_view &id) {
     if (id.empty() || id.size() > 256) {
       return false;
     }
-    for (const char c : id) {
-      if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+    std::string decoded;
+    return base64url_decode(id, decoded) && decoded.size() >= 16;
+  }
+
+  bool DirectAuthManager::valid_pending_id_format(const std::string_view &id) {
+    if (id.empty() || id.size() > 64) {
+      return false;
+    }
+    std::string decoded;
+    return base64url_decode(id, decoded) && decoded.size() == 16;
+  }
+
+  bool DirectAuthManager::valid_proof_format(const std::string_view &proof) {
+    std::string decoded;
+    return base64url_decode(proof, decoded) && decoded.size() == 32;
+  }
+
+  bool parse_enrollment_request_body(
+    const std::string_view raw_body,
+    EnrollmentRequestFields &fields,
+    std::string &error_code
+  ) {
+    fields = {};
+    error_code.clear();
+    if (raw_body.size() > MAX_BODY_BYTES) {
+      error_code = "BODY_TOO_LARGE";
+      return false;
+    }
+
+    try {
+      const auto body = nlohmann::json::parse(raw_body.begin(), raw_body.end());
+      if (!body.is_object()) {
+        error_code = "MALFORMED";
+        return false;
+      }
+
+      const auto protocol_it = body.find("protocol");
+      if (protocol_it == body.end() ||
+          !(protocol_it->is_number_integer() || protocol_it->is_number_unsigned())) {
+        error_code = "MALFORMED";
+        return false;
+      }
+      const bool protocol_one = protocol_it->is_number_unsigned() ?
+                                  protocol_it->get<std::uint64_t>() == 1u :
+                                  protocol_it->get<std::int64_t>() == 1;
+      if (!protocol_one) {
+        error_code = "UNSUPPORTED_VERSION";
+        return false;
+      }
+
+      const auto read_required_string = [&](const char *key, std::string &out) {
+        const auto it = body.find(key);
+        if (it == body.end() || !it->is_string()) {
+          return false;
+        }
+        out = it->get<std::string>();
+        return true;
+      };
+
+      if (!read_required_string("enrollment_id", fields.enrollment_id) ||
+          !read_required_string("client_fingerprint", fields.client_fingerprint) ||
+          !read_required_string("client_name", fields.client_name) ||
+          !read_required_string("client_uuid", fields.client_uuid) ||
+          !read_required_string("proof", fields.proof)) {
+        fields = {};
+        error_code = "MALFORMED";
+        return false;
+      }
+      return true;
+    } catch (...) {
+      fields = {};
+      error_code = "MALFORMED";
+      return false;
+    }
+  }
+
+  bool parse_pending_id_query_values(
+    const std::vector<std::string> &values,
+    std::string &pending_id
+  ) {
+    pending_id.clear();
+    if (values.size() != 1 || !DirectAuthManager::valid_pending_id_format(values.front())) {
+      return false;
+    }
+    pending_id = values.front();
+    return true;
+  }
+
+  bool valid_setup_host(const std::string_view host) {
+    if (host.empty() || host.size() > 255) {
+      return false;
+    }
+    for (const auto ch : host) {
+      const auto c = static_cast<unsigned char>(ch);
+      if (c <= 0x20 || c >= 0x7f) {
         return false;
       }
     }
+    if (host.find_first_of("/?#[]@") != std::string_view::npos) {
+      return false;
+    }
+
+    const auto colon_count = static_cast<std::size_t>(std::count(host.begin(), host.end(), ':'));
+    if (colon_count == 1) {
+      return false;
+    }
+
+    boost::system::error_code ec;
+    (void) boost::asio::ip::make_address(std::string(host), ec);
+    if (!ec) {
+      return true;
+    }
+
+    // A colon that was not accepted as an IP literal is an embedded port or
+    // otherwise malformed address, not a DNS hostname.
+    if (host.find(':') != std::string_view::npos || host.size() > 253) {
+      return false;
+    }
+    const bool numeric_dotted = std::all_of(host.begin(), host.end(), [](const char ch) {
+      return (ch >= '0' && ch <= '9') || ch == '.';
+    });
+    if (numeric_dotted) {
+      return false;
+    }
+
+    std::size_t label_start = 0;
+    while (label_start < host.size()) {
+      const auto label_end = host.find('.', label_start);
+      const auto end = label_end == std::string_view::npos ? host.size() : label_end;
+      const auto label = host.substr(label_start, end - label_start);
+      if (label.empty() || label.size() > 63) {
+        return false;
+      }
+      const auto is_alnum = [](const char ch) {
+        return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
+      };
+      if (!is_alnum(label.front()) || !is_alnum(label.back()) ||
+          !std::all_of(label.begin(), label.end(), [&](const char ch) { return is_alnum(ch) || ch == '-'; })) {
+        return false;
+      }
+      if (label_end == std::string_view::npos) {
+        break;
+      }
+      label_start = label_end + 1;
+    }
     return true;
+  }
+
+  std::string generate_unique_named_device_uuid(
+    const std::vector<crypto::p_named_cert_t> &named_devices,
+    const std::function<std::string()> &generate_uuid
+  ) {
+    if (!generate_uuid) {
+      return {};
+    }
+
+    std::unordered_set<std::string> existing_uuids;
+    existing_uuids.reserve(named_devices.size());
+    for (const auto &device : named_devices) {
+      if (device && !device->uuid.empty()) {
+        existing_uuids.insert(device->uuid);
+      }
+    }
+
+    // UUID collisions are practically impossible with the production
+    // generator, but enforce the data-model invariant rather than assuming it.
+    for (std::size_t attempt = 0; attempt < 128; ++attempt) {
+      auto candidate = generate_uuid();
+      if (!candidate.empty() && !existing_uuids.contains(candidate)) {
+        return candidate;
+      }
+    }
+    return {};
+  }
+
+  std::vector<std::string> remove_named_devices_by_fingerprint(
+    const std::string &fingerprint,
+    std::vector<crypto::p_named_cert_t> &named_devices
+  ) {
+    std::vector<std::string> removed_uuids;
+    if (!DirectAuthManager::valid_fingerprint_format(fingerprint)) {
+      return removed_uuids;
+    }
+
+    for (auto it = named_devices.begin(); it != named_devices.end();) {
+      const auto &named_cert = *it;
+      if (!named_cert) {
+        ++it;
+        continue;
+      }
+      const auto cert = crypto::x509(named_cert->cert);
+      const auto stored_fingerprint = cert ? crypto::spki_sha256_fingerprint(cert) : std::string();
+      if (!stored_fingerprint.empty() && stored_fingerprint == fingerprint) {
+        if (!named_cert->uuid.empty()) {
+          removed_uuids.push_back(named_cert->uuid);
+        }
+        it = named_devices.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    return removed_uuids;
+  }
+
+  std::string DirectAuthManager::percent_encode_query_value(const std::string_view &value) {
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(value.size());
+    for (const unsigned char c : value) {
+      const bool unreserved =
+        (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '.' || c == '_' || c == '~';
+      if (unreserved) {
+        out.push_back(static_cast<char>(c));
+      } else {
+        out.push_back('%');
+        out.push_back(hex[c >> 4]);
+        out.push_back(hex[c & 0x0F]);
+      }
+    }
+    return out;
   }
 
   DeviceTrustState DirectAuthManager::classify(
     const std::string &fingerprint,
     const std::string &cert_pem,
-    const std::function<bool(const std::string &cert_pem)> &is_trusted_cert_pem
+    const std::function<bool(const std::string &fingerprint)> &is_trusted_fingerprint
   ) const {
     if (fingerprint.empty()) {
       return DeviceTrustState::Unknown;
@@ -205,7 +431,8 @@ namespace direct_auth {
       }
     }
 
-    if (is_trusted_cert_pem && is_trusted_cert_pem(cert_pem)) {
+    (void) cert_pem;
+    if (is_trusted_fingerprint && is_trusted_fingerprint(fingerprint)) {
       return DeviceTrustState::Trusted;
     }
     return DeviceTrustState::Unknown;
@@ -219,13 +446,20 @@ namespace direct_auth {
   ) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
 
-    // Enrollment IDs must be >=128 bits of CSPRNG randomness.
-    std::string enrollment_id_bytes = crypto::rand(16);
-    std::string secret_bytes = crypto::rand(32);
+    // Enrollment IDs and secrets fail closed if OpenSSL cannot supply CSPRNG
+    // material. Tests inject the same checked provider contract.
+    std::string enrollment_id_bytes;
+    std::string secret_bytes;
+    if (!random_bytes_provider_ ||
+        !random_bytes_provider_(16, enrollment_id_bytes) || enrollment_id_bytes.size() != 16 ||
+        !random_bytes_provider_(32, secret_bytes) || secret_bytes.size() != 32) {
+      enrollment_.reset();
+      return {};
+    }
 
     EnrollmentSession session;
     session.enrollment_id = base64url_encode(enrollment_id_bytes);
-    session.secret = base64url_encode(secret_bytes);
+    std::copy(secret_bytes.begin(), secret_bytes.end(), session.secret.begin());
     session.host = host;
     session.https_port = https_port;
     session.host_fingerprint = host_fingerprint;
@@ -240,11 +474,14 @@ namespace direct_auth {
     info.expires_at_unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(enrollment_->expires_at.time_since_epoch()).count();
 
     const auto &enroll = *enrollment_;
-    info.setup_uri = "vibedirect://enroll?v=1&host=" + enroll.host +
+    const auto secret_text = base64url_encode(std::string_view {
+      reinterpret_cast<const char *>(enroll.secret.data()), enroll.secret.size()
+    });
+    info.setup_uri = "vibedirect://enroll?v=1&host=" + percent_encode_query_value(enroll.host) +
                      "&https_port=" + std::to_string(enroll.https_port) +
-                     "&hostfp=" + enroll.host_fingerprint +
-                     "&eid=" + enroll.enrollment_id +
-                     "&secret=" + enroll.secret;
+                     "&hostfp=" + percent_encode_query_value(enroll.host_fingerprint) +
+                     "&eid=" + percent_encode_query_value(enroll.enrollment_id) +
+                     "&secret=" + percent_encode_query_value(secret_text);
     return info;
   }
 
@@ -275,11 +512,14 @@ namespace direct_auth {
     info.state = EnrollmentState::Open;
     info.enrollment_id = enrollment_->enrollment_id;
     info.expires_at_unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(enrollment_->expires_at.time_since_epoch()).count();
-    info.setup_uri = "vibedirect://enroll?v=1&host=" + enrollment_->host +
+    const auto secret_text = base64url_encode(std::string_view {
+      reinterpret_cast<const char *>(enrollment_->secret.data()), enrollment_->secret.size()
+    });
+    info.setup_uri = "vibedirect://enroll?v=1&host=" + percent_encode_query_value(enrollment_->host) +
                      "&https_port=" + std::to_string(enrollment_->https_port) +
-                     "&hostfp=" + enrollment_->host_fingerprint +
-                     "&eid=" + enrollment_->enrollment_id +
-                     "&secret=" + enrollment_->secret;
+                     "&hostfp=" + percent_encode_query_value(enrollment_->host_fingerprint) +
+                     "&eid=" + percent_encode_query_value(enrollment_->enrollment_id) +
+                     "&secret=" + percent_encode_query_value(secret_text);
     return info;
   }
 
@@ -295,9 +535,8 @@ namespace direct_auth {
     std::string *out_pending_id,
     std::string *out_error_code
   ) {
-    if (!valid_enrollment_id_format(enrollment_id) || !valid_fingerprint_format(body_fingerprint) || body_proof.empty()) {
-      if (out_error_code) *out_error_code = "ENROLLMENT_INVALID_PROOF";
-      return false;
+    if (out_pending_id) {
+      out_pending_id->clear();
     }
     if (body_client_name.size() > MAX_CLIENT_NAME_BYTES || body_client_uuid.size() > MAX_CLIENT_UUID_BYTES) {
       if (out_error_code) *out_error_code = "ENROLLMENT_INVALID_PROOF";
@@ -308,6 +547,11 @@ namespace direct_auth {
 
     if (!enrollment_ || enrollment_->consumed || enrollment_->expires_at <= std::chrono::system_clock::now()) {
       if (out_error_code) *out_error_code = "ENROLLMENT_CLOSED";
+      return false;
+    }
+
+    if (!valid_enrollment_id_format(enrollment_id) || !valid_fingerprint_format(body_fingerprint) || !valid_proof_format(body_proof)) {
+      if (out_error_code) *out_error_code = "ENROLLMENT_INVALID_PROOF";
       return false;
     }
 
@@ -331,8 +575,15 @@ namespace direct_auth {
     }
 
     const auto proof_input = enrollment_proof_input(enrollment_id, enrollment_->host_fingerprint, actual_fingerprint);
-    const auto expected_proof = hmac_sha256_base64url(enrollment_->secret, proof_input);
-    if (expected_proof.empty() || !constant_time_equal(body_proof, expected_proof)) {
+    const std::string_view raw_secret {
+      reinterpret_cast<const char *>(enrollment_->secret.data()), enrollment_->secret.size()
+    };
+    const auto expected_proof = hmac_sha256_base64url(raw_secret, proof_input);
+    std::string supplied_proof_bytes;
+    std::string expected_proof_bytes;
+    const bool proof_decoded = base64url_decode(body_proof, supplied_proof_bytes) && supplied_proof_bytes.size() == 32;
+    const bool expected_decoded = base64url_decode(expected_proof, expected_proof_bytes) && expected_proof_bytes.size() == 32;
+    if (!proof_decoded || !expected_decoded || !constant_time_equal(supplied_proof_bytes, expected_proof_bytes)) {
       if (!rate_limit_failed_attempt(actual_fingerprint, source_ip)) {
         if (out_error_code) *out_error_code = "RATE_LIMITED";
         return false;
@@ -341,14 +592,13 @@ namespace direct_auth {
       return false;
     }
 
-    // Consume the enrollment session atomically.
-    enrollment_->consumed = true;
-
     // A previously blocked/revoked fingerprint stays blocked even with a valid
     // fresh token until an admin explicitly unblocks it.
     const auto blocked_it = blocked_.find(actual_fingerprint);
     if (blocked_it != blocked_.end()) {
-      if (out_error_code) *out_error_code = "DEVICE_BLOCKED";
+      if (out_error_code) {
+        *out_error_code = blocked_it->second.reason == "revoked" ? "DEVICE_REVOKED" : "DEVICE_BLOCKED";
+      }
       return false;
     }
 
@@ -362,9 +612,24 @@ namespace direct_auth {
       return false;
     }
 
-    const auto pending_id_bytes = crypto::rand(16);
+    // Generate a checked pending ID before consuming the one-time enrollment.
+    // RNG failure therefore cannot burn a valid token without creating state.
+    std::string pending_id_bytes;
+    if (!random_bytes_provider_ || !random_bytes_provider_(16, pending_id_bytes) || pending_id_bytes.size() != 16) {
+      if (out_error_code) *out_error_code = "INTERNAL_ERROR";
+      return false;
+    }
+    const auto pending_id = base64url_encode(pending_id_bytes);
+    if (!valid_pending_id_format(pending_id) || pending_by_id_.contains(pending_id)) {
+      if (out_error_code) *out_error_code = "INTERNAL_ERROR";
+      return false;
+    }
+
+    // Consume only after every proof/security-state/bounds/RNG check succeeds.
+    enrollment_->consumed = true;
+
     PendingEnrollment pending;
-    pending.info.pending_id = base64url_encode(pending_id_bytes);
+    pending.info.pending_id = pending_id;
     pending.info.fingerprint = actual_fingerprint;
     pending.info.name = body_client_name;
     pending.info.uuid = body_client_uuid;
@@ -375,7 +640,6 @@ namespace direct_auth {
     pending.info.expires_at_unix_ms = pending.info.created_at_unix_ms + PENDING_TTL_MS;
     pending.proof = body_proof;
 
-    const auto pending_id = pending.info.pending_id;
     pending_by_id_.emplace(pending_id, std::move(pending));
     pending_by_fingerprint_.emplace(actual_fingerprint, PendingState::Pending);
 
@@ -385,7 +649,11 @@ namespace direct_auth {
     return true;
   }
 
-  PendingInfo DirectAuthManager::pending_status(const std::string &pending_id, const std::string &fingerprint) {
+  PendingInfo DirectAuthManager::pending_status(
+    const std::string &pending_id,
+    const std::string &fingerprint,
+    const std::int64_t now_override_ms
+  ) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     const auto it = pending_by_id_.find(pending_id);
     if (it == pending_by_id_.end()) {
@@ -398,9 +666,13 @@ namespace direct_auth {
       info.state = PendingState::Expired;
       return info;
     }
-    if (it->second.info.expires_at_unix_ms <= now_ms() && it->second.info.state == PendingState::Pending) {
-      it->second.info.state = PendingState::Expired;
-      pending_by_fingerprint_[fingerprint] = PendingState::Expired;
+    const auto now = now_override_ms != 0 ? now_override_ms : now_ms();
+    if (it->second.info.expires_at_unix_ms <= now && it->second.info.state != PendingState::Accepting) {
+      pending_by_fingerprint_.erase(it->second.info.fingerprint);
+      pending_by_id_.erase(it);
+      PendingInfo info;
+      info.state = PendingState::Expired;
+      return info;
     }
     return it->second.info;
   }
@@ -424,23 +696,57 @@ namespace direct_auth {
     const std::string &pending_id,
     const std::function<bool(const PendingInfo &)> &accept_trusted_cert
   ) {
+    PendingInfo candidate;
+    {
+      std::lock_guard<std::recursive_mutex> lock(mutex_);
+      const auto it = pending_by_id_.find(pending_id);
+      if (it == pending_by_id_.end() || it->second.info.state != PendingState::Pending) {
+        return false;
+      }
+      if (it->second.info.expires_at_unix_ms <= now_ms()) {
+        pending_by_fingerprint_.erase(it->second.info.fingerprint);
+        pending_by_id_.erase(it);
+        return false;
+      }
+      it->second.info.state = PendingState::Accepting;
+      pending_by_fingerprint_[it->second.info.fingerprint] = PendingState::Accepting;
+      candidate = it->second.info;
+    }
+
+    bool accepted = false;
+    try {
+      accepted = accept_trusted_cert && accept_trusted_cert(candidate);
+    } catch (...) {
+      accepted = false;
+    }
+
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     const auto it = pending_by_id_.find(pending_id);
-    if (it == pending_by_id_.end() || it->second.info.state != PendingState::Pending) {
+    if (it == pending_by_id_.end() || it->second.info.state != PendingState::Accepting ||
+        it->second.info.fingerprint != candidate.fingerprint) {
       return false;
     }
-    if (it->second.info.expires_at_unix_ms <= now_ms()) {
-      it->second.info.state = PendingState::Expired;
-      pending_by_fingerprint_[it->second.info.fingerprint] = PendingState::Expired;
+    if (blocked_.contains(candidate.fingerprint)) {
+      it->second.info.state = PendingState::Denied;
+      it->second.info.expires_at_unix_ms = now_ms() + TERMINAL_PENDING_GRACE_MS;
+      it->second.expired_while_accepting = false;
+      pending_by_fingerprint_[candidate.fingerprint] = PendingState::Denied;
       return false;
     }
-
-    if (!accept_trusted_cert(it->second.info)) {
+    if (!accepted) {
+      if (it->second.expired_while_accepting || it->second.info.expires_at_unix_ms <= now_ms()) {
+        pending_by_fingerprint_.erase(candidate.fingerprint);
+        pending_by_id_.erase(it);
+        return false;
+      }
+      it->second.info.state = PendingState::Pending;
+      pending_by_fingerprint_[candidate.fingerprint] = PendingState::Pending;
       return false;
     }
-
     it->second.info.state = PendingState::Accepted;
-    pending_by_fingerprint_[it->second.info.fingerprint] = PendingState::Accepted;
+    it->second.info.expires_at_unix_ms = now_ms() + TERMINAL_PENDING_GRACE_MS;
+    it->second.expired_while_accepting = false;
+    pending_by_fingerprint_[candidate.fingerprint] = PendingState::Accepted;
     return true;
   }
 
@@ -448,15 +754,18 @@ namespace direct_auth {
     const std::string &pending_id,
     const std::function<void(const std::string &fingerprint)> &block_fingerprint
   ) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    const auto it = pending_by_id_.find(pending_id);
-    if (it == pending_by_id_.end() || it->second.info.state != PendingState::Pending) {
-      return false;
+    std::string fingerprint;
+    {
+      std::lock_guard<std::recursive_mutex> lock(mutex_);
+      const auto it = pending_by_id_.find(pending_id);
+      if (it == pending_by_id_.end() || it->second.info.state != PendingState::Pending) {
+        return false;
+      }
+      fingerprint = it->second.info.fingerprint;
+      it->second.info.state = PendingState::Denied;
+      it->second.info.expires_at_unix_ms = now_ms() + TERMINAL_PENDING_GRACE_MS;
+      pending_by_fingerprint_[fingerprint] = PendingState::Denied;
     }
-
-    const auto fingerprint = it->second.info.fingerprint;
-    it->second.info.state = PendingState::Denied;
-    pending_by_fingerprint_[fingerprint] = PendingState::Denied;
 
     if (block_fingerprint) {
       block_fingerprint(fingerprint);
@@ -483,6 +792,18 @@ namespace direct_auth {
     info.uuid = uuid;
     info.created_at_unix_ms = now_ms();
     blocked_[fingerprint] = std::move(info);
+
+    // Explicit blocking wins over pending/accepting approval state. The host
+    // serializes trusted-device side effects with the same policy.
+    for (auto &[_, pending] : pending_by_id_) {
+      if (pending.info.fingerprint == fingerprint &&
+          (pending.info.state == PendingState::Pending || pending.info.state == PendingState::Accepting)) {
+        pending.info.state = PendingState::Denied;
+        pending.info.expires_at_unix_ms = now_ms() + TERMINAL_PENDING_GRACE_MS;
+        pending.expired_while_accepting = false;
+        pending_by_fingerprint_[fingerprint] = PendingState::Denied;
+      }
+    }
   }
 
   void DirectAuthManager::revoke_fingerprint(const std::string &fingerprint) {
@@ -512,20 +833,26 @@ namespace direct_auth {
     return blocked_.contains(fingerprint);
   }
 
-  void DirectAuthManager::expire_stale() {
+  void DirectAuthManager::expire_stale(std::int64_t now_override_ms) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    const auto now = now_ms();
-    if (enrollment_ && enrollment_->expires_at <= std::chrono::system_clock::now()) {
+    const auto now = now_override_ms != 0 ? now_override_ms : now_ms();
+    if (enrollment_ && std::chrono::duration_cast<std::chrono::milliseconds>(enrollment_->expires_at.time_since_epoch()).count() <= now) {
       enrollment_.reset();
     }
 
-    std::erase_if(pending_by_id_, [&](const auto &entry) {
-      if (entry.second.info.expires_at_unix_ms <= now && entry.second.info.state == PendingState::Pending) {
-        pending_by_fingerprint_.erase(entry.second.info.fingerprint);
-        return true;
+    for (auto it = pending_by_id_.begin(); it != pending_by_id_.end();) {
+      if (it->second.info.expires_at_unix_ms > now) {
+        ++it;
+        continue;
       }
-      return false;
-    });
+      if (it->second.info.state == PendingState::Accepting) {
+        it->second.expired_while_accepting = true;
+        ++it;
+        continue;
+      }
+      pending_by_fingerprint_.erase(it->second.info.fingerprint);
+      it = pending_by_id_.erase(it);
+    }
   }
 
   void DirectAuthManager::reset_ephemeral() {
@@ -559,13 +886,37 @@ namespace direct_auth {
     constexpr std::int64_t kMaxFingerprint = 3;
     constexpr std::int64_t kMaxGlobal = 30;
 
-    const auto ip_count = count_recent(ip_failures_[source_ip], kWindowMs);
-    const auto fp_count = fingerprint.empty() ? 0 : count_recent(fingerprint_failures_[fingerprint], kWindowMs);
+    const auto now = now_ms();
+    const auto cutoff = now - kWindowMs;
+    const auto prune_map = [cutoff](auto &map) {
+      std::erase_if(map, [cutoff](auto &entry) {
+        auto &timestamps = entry.second;
+        std::erase_if(timestamps, [cutoff](std::int64_t ts) { return ts < cutoff; });
+        return timestamps.empty();
+      });
+    };
+    prune_map(ip_failures_);
+    prune_map(fingerprint_failures_);
+    std::erase_if(global_failures_, [cutoff](std::int64_t ts) { return ts < cutoff; });
+
+    const auto bucket_count = [now, kWindowMs](const auto &map, const std::string &key) -> std::int64_t {
+      if (key.empty()) return 0;
+      const auto it = map.find(key);
+      if (it == map.end()) return 0;
+      const auto cutoff = now - kWindowMs;
+      return static_cast<std::int64_t>(std::count_if(it->second.begin(), it->second.end(), [cutoff](std::int64_t ts) {
+        return ts >= cutoff;
+      }));
+    };
+    const auto ip_count = bucket_count(ip_failures_, source_ip);
+    const auto fp_count = bucket_count(fingerprint_failures_, fingerprint);
     const auto global_count = count_recent(global_failures_, kWindowMs);
 
     const bool allowed = ip_count < kMaxIp && fp_count < kMaxFingerprint && global_count < kMaxGlobal;
     if (allowed) {
-      push_timestamp(ip_failures_[source_ip], kWindowMs);
+      if (!source_ip.empty()) {
+        push_timestamp(ip_failures_[source_ip], kWindowMs);
+      }
       if (!fingerprint.empty()) {
         push_timestamp(fingerprint_failures_[fingerprint], kWindowMs);
       }
@@ -574,16 +925,72 @@ namespace direct_auth {
     return allowed;
   }
 
+  RateLimitStats DirectAuthManager::rate_limit_stats() const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    return {
+      .ip_buckets = ip_failures_.size(),
+      .fingerprint_buckets = fingerprint_failures_.size(),
+      .global_timestamps = global_failures_.size(),
+    };
+  }
+
+  void DirectAuthManager::prune_rate_limits(std::int64_t now_override_ms) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    constexpr std::int64_t kWindowMs = 60 * 1000;
+    const auto now = now_override_ms != 0 ? now_override_ms : now_ms();
+    const auto cutoff = now - kWindowMs;
+    const auto prune_map = [cutoff](auto &map) {
+      std::erase_if(map, [cutoff](auto &entry) {
+        auto &timestamps = entry.second;
+        std::erase_if(timestamps, [cutoff](std::int64_t ts) { return ts < cutoff; });
+        return timestamps.empty();
+      });
+    };
+    prune_map(ip_failures_);
+    prune_map(fingerprint_failures_);
+    std::erase_if(global_failures_, [cutoff](std::int64_t ts) { return ts < cutoff; });
+  }
+
   bool cert_matches_any_named_device(
-    const std::string &cert_pem,
+    const std::string &fingerprint,
     const std::vector<crypto::p_named_cert_t> &named_devices
   ) {
-    if (cert_pem.empty()) {
+    return find_named_device_by_fingerprint(fingerprint, named_devices) != nullptr;
+  }
+
+  crypto::p_named_cert_t find_named_device_by_fingerprint(
+    const std::string &fingerprint,
+    const std::vector<crypto::p_named_cert_t> &named_devices
+  ) {
+    if (!DirectAuthManager::valid_fingerprint_format(fingerprint)) {
+      return {};
+    }
+    const auto it = std::find_if(named_devices.begin(), named_devices.end(), [&](const crypto::p_named_cert_t &named_cert) {
+      if (!named_cert) {
+        return false;
+      }
+      const auto cert = crypto::x509(named_cert->cert);
+      if (!cert) {
+        return false;
+      }
+      // The certificate-derived value is authoritative. A persisted field is
+      // only a cache/migration aid and must never override conflicting cert data.
+      return crypto::spki_sha256_fingerprint(cert) == fingerprint;
+    });
+    return it == named_devices.end() ? crypto::p_named_cert_t {} : *it;
+  }
+
+  bool is_public_direct_auth_path(std::string_view path) {
+    return path == "/direct/v1/status" ||
+           path == "/direct/v1/enroll/request" ||
+           path == "/direct/v1/enroll/status";
+  }
+
+  bool route_requires_trusted_client(std::string_view path) {
+    if (path == "/serverinfo" || path == "/pair" || path == "/unpair") {
       return false;
     }
-    return std::any_of(named_devices.begin(), named_devices.end(), [&](const crypto::p_named_cert_t &named_cert) {
-      return named_cert && named_cert->cert == cert_pem;
-    });
+    return !is_public_direct_auth_path(path);
   }
 
 }  // namespace direct_auth

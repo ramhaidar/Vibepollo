@@ -6,11 +6,13 @@
 
 // standard includes
 #include <chrono>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -22,6 +24,7 @@ namespace direct_auth {
 
   constexpr std::int64_t ENROLLMENT_TTL_MS = 120 * 1000;
   constexpr std::int64_t PENDING_TTL_MS = 5 * 60 * 1000;
+  constexpr std::int64_t TERMINAL_PENDING_GRACE_MS = 30 * 1000;
   constexpr std::size_t MAX_PENDING_CANDIDATES = 8;
   constexpr std::size_t MAX_BODY_BYTES = 16 * 1024;
   constexpr std::size_t MAX_CLIENT_NAME_BYTES = 128;
@@ -42,6 +45,7 @@ namespace direct_auth {
 
   enum class PendingState {
     Pending,
+    Accepting,
     Accepted,
     Denied,
     Expired,
@@ -74,6 +78,63 @@ namespace direct_auth {
     std::int64_t created_at_unix_ms {0};
   };
 
+  struct RateLimitStats {
+    std::size_t ip_buckets {0};
+    std::size_t fingerprint_buckets {0};
+    std::size_t global_timestamps {0};
+  };
+
+  struct EnrollmentRequestFields {
+    std::string enrollment_id;
+    std::string client_fingerprint;
+    std::string client_name;
+    std::string client_uuid;
+    std::string proof;
+  };
+
+  /**
+   * @brief Parse and type-check the public Direct Auth enrollment request body.
+   *
+   * Returns a stable machine-readable error code in `error_code` and never
+   * exposes JSON parser/type exceptions to the HTTP layer.
+   */
+  bool parse_enrollment_request_body(
+    std::string_view raw_body,
+    EnrollmentRequestFields &fields,
+    std::string &error_code
+  );
+
+  /**
+   * @brief Require exactly one canonical generated pending-id query value.
+   */
+  bool parse_pending_id_query_values(
+    const std::vector<std::string> &values,
+    std::string &pending_id
+  );
+
+  /**
+   * @brief Validate the client-reachable setup host as an address/hostname only.
+   */
+  bool valid_setup_host(std::string_view host);
+
+  /**
+   * @brief Generate a non-empty host-controlled UUID not already used by a
+   * named device. Client-provided UUID metadata is intentionally not accepted.
+   */
+  std::string generate_unique_named_device_uuid(
+    const std::vector<crypto::p_named_cert_t> &named_devices,
+    const std::function<std::string()> &generate_uuid
+  );
+
+  /**
+   * @brief Remove trusted named devices whose SPKI fingerprint matches.
+   * @return UUIDs of removed devices for session teardown outside the registry lock.
+   */
+  std::vector<std::string> remove_named_devices_by_fingerprint(
+    const std::string &fingerprint,
+    std::vector<crypto::p_named_cert_t> &named_devices
+  );
+
   /**
    * @brief Pure Vibe Direct Auth v1 state manager.
    *
@@ -87,7 +148,10 @@ namespace direct_auth {
    */
   class DirectAuthManager {
   public:
-    DirectAuthManager() = default;
+    using RandomBytesProvider = std::function<bool(std::size_t bytes, std::string &out)>;
+
+    DirectAuthManager();
+    explicit DirectAuthManager(RandomBytesProvider random_bytes_provider);
     DirectAuthManager(DirectAuthManager &&) noexcept = default;
     DirectAuthManager &operator=(DirectAuthManager &&) noexcept = default;
 
@@ -99,14 +163,14 @@ namespace direct_auth {
     /**
      * @brief Resolve trust for a peer fingerprint.
      *
-     * The `is_trusted_cert_pem` callback is used to verify against the existing
+     * The `is_trusted_fingerprint` callback is used to verify against the existing
      * named-device trust database so DirectAuthManager does not maintain a
      * second trusted-device database.
      */
     DeviceTrustState classify(
       const std::string &fingerprint,
       const std::string &cert_pem,
-      const std::function<bool(const std::string &cert_pem)> &is_trusted_cert_pem
+      const std::function<bool(const std::string &fingerprint)> &is_trusted_fingerprint
     ) const;
 
     // ---- Enrollment ------------------------------------------------------
@@ -153,7 +217,11 @@ namespace direct_auth {
       std::string *out_error_code = nullptr
     );
 
-    PendingInfo pending_status(const std::string &pending_id, const std::string &fingerprint);
+    PendingInfo pending_status(
+      const std::string &pending_id,
+      const std::string &fingerprint,
+      std::int64_t now_override_ms = 0
+    );
     std::vector<PendingInfo> pending_candidates() const;
 
     // ---- Admin actions ----------------------------------------------------
@@ -203,7 +271,7 @@ namespace direct_auth {
     /**
      * @brief Expire stale in-memory enrollment/pending records.
      */
-    void expire_stale();
+    void expire_stale(std::int64_t now_override_ms = 0);
 
     /**
      * @brief Reset enrollment and pending ephemeral state (host restart path).
@@ -232,6 +300,8 @@ namespace direct_auth {
      * @return false when the attempt should be rejected as rate limited.
      */
     bool rate_limit_failed_attempt(const std::string &fingerprint, const std::string &source_ip);
+    RateLimitStats rate_limit_stats() const;
+    void prune_rate_limits(std::int64_t now_override_ms = 0);
 
     // ---- Crypto/format helpers (public for shared vectors/tests) ----------
 
@@ -241,8 +311,8 @@ namespace direct_auth {
     static std::string base64url_encode(const std::string_view &bytes);
 
     /**
-     * @brief Decode base64url (with or without padding). Returns false on
-     * malformed input.
+     * @brief Decode canonical base64url without padding. Returns false on
+     * malformed or non-canonical input.
      */
     static bool base64url_decode(const std::string_view &input, std::string &out);
 
@@ -267,11 +337,14 @@ namespace direct_auth {
 
     static bool valid_fingerprint_format(const std::string_view &fp);
     static bool valid_enrollment_id_format(const std::string_view &id);
+    static bool valid_pending_id_format(const std::string_view &id);
+    static bool valid_proof_format(const std::string_view &proof);
+    static std::string percent_encode_query_value(const std::string_view &value);
 
   private:
     struct EnrollmentSession {
       std::string enrollment_id;
-      std::string secret;
+      std::array<std::uint8_t, 32> secret {};
       std::string host;
       std::uint16_t https_port {0};
       std::string host_fingerprint;
@@ -282,6 +355,7 @@ namespace direct_auth {
     struct PendingEnrollment {
       PendingInfo info;
       std::string proof;
+      bool expired_while_accepting {false};
     };
 
     mutable std::recursive_mutex mutex_;
@@ -292,14 +366,23 @@ namespace direct_auth {
     std::unordered_map<std::string, std::vector<std::int64_t>> ip_failures_;
     std::unordered_map<std::string, std::vector<std::int64_t>> fingerprint_failures_;
     std::vector<std::int64_t> global_failures_;
+    RandomBytesProvider random_bytes_provider_;
   };
 
   /**
    * @brief Convenience wrapper for the nvhttp certificate trust callback.
    */
   bool cert_matches_any_named_device(
-    const std::string &cert_pem,
+    const std::string &fingerprint,
     const std::vector<crypto::p_named_cert_t> &named_devices
   );
+
+  crypto::p_named_cert_t find_named_device_by_fingerprint(
+    const std::string &fingerprint,
+    const std::vector<crypto::p_named_cert_t> &named_devices
+  );
+
+  bool is_public_direct_auth_path(std::string_view path);
+  bool route_requires_trusted_client(std::string_view path);
 
 }  // namespace direct_auth

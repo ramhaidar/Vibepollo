@@ -73,3 +73,18 @@ test('host compute readouts label current and peak values explicitly', () => {
   );
   assert.doesNotMatch(chart, /t\('stats\.peak'\)[^\n]*\/[^\n]*t\('stats\.current'\)/);
 });
+
+test('Direct Auth add-device UI uses an explicit reachable host and never supplies the Direct TLS port', () => {
+  const panel = readFileSync(
+    new URL('../components/devices/DirectAuthPanel.vue', import.meta.url),
+    'utf8',
+  );
+
+  assert.match(panel, /const reachableHost = ref\(''\)/);
+  assert.match(panel, /function isLoopbackHost\(/);
+  assert.match(panel, /window\.location\.hostname/);
+  assert.match(panel, /host: reachableHost\.value\.trim\(\)/);
+  assert.doesNotMatch(panel, /window\.location\.port/);
+  assert.doesNotMatch(panel, /https_port\s*:/);
+  assert.doesNotMatch(panel, /localStorage|sessionStorage/);
+});

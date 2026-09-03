@@ -102,7 +102,7 @@ namespace nvhttp {
     bool valid_tls_cert {false};
   };
 
-  thread_local peer_auth_context_t tl_peer_auth_context;
+  using peer_auth_context_ptr = std::shared_ptr<const peer_auth_context_t>;
   direct_auth::DirectAuthManager direct_auth_manager;
 
   struct pair_session_t;
@@ -114,8 +114,6 @@ namespace nvhttp {
   static std::string otp_passphrase;
   static std::string otp_device_name;
   static std::chrono::time_point<std::chrono::steady_clock> otp_creation_time;
-  thread_local crypto::x509_t tl_peer_certificate;
-
   std::string cert_subject_name_for_log(const crypto::x509_t &cert) {
     auto subject_name = crypto::subject_name(cert.get());
     if (subject_name.empty()) {
@@ -1258,6 +1256,7 @@ namespace nvhttp {
     std::unordered_map<std::string, pair_session_t> map_id_sess;
     client_t client_root;
     std::mutex client_mutex;
+    std::mutex direct_auth_trust_transition_mutex;
     std::atomic<uint32_t> session_id_counter;
 
 
@@ -1281,6 +1280,17 @@ namespace nvhttp {
         }
       }
       return snapshot;
+    }
+
+    std::string repair_named_device_spki_fingerprint(crypto::named_cert_t &named_cert) {
+      const auto cert = crypto::x509(named_cert.cert);
+      const auto derived = cert ? crypto::spki_sha256_fingerprint(cert) : std::string();
+      if (!direct_auth::DirectAuthManager::valid_fingerprint_format(derived)) {
+        named_cert.spki_fingerprint.clear();
+        return {};
+      }
+      named_cert.spki_fingerprint = derived;
+      return derived;
     }
 
     std::string get_arg(const args_t &args, const char *name, const char *default_value) {
@@ -1412,6 +1422,9 @@ namespace nvhttp {
           }
           named_cert_node["name"] = final_name;
           named_cert_node["cert"] = named_cert_p->cert;
+          if (const auto fingerprint = repair_named_device_spki_fingerprint(*named_cert_p); !fingerprint.empty()) {
+            named_cert_node["spki_fingerprint"] = fingerprint;
+          }
           named_cert_node["uuid"] = named_cert_p->uuid;
           named_cert_node["display_mode"] = named_cert_p->display_mode;
           if (!named_cert_p->virtual_display_mode_override.empty()) {
@@ -1605,6 +1618,7 @@ namespace nvhttp {
               auto named_cert_p = std::make_shared<crypto::named_cert_t>();
               named_cert_p->name = "";
               named_cert_p->cert = el.get<std::string>();
+              repair_named_device_spki_fingerprint(*named_cert_p);
               named_cert_p->uuid = uuid_util::uuid_t::generate().string();
               named_cert_p->display_mode = "";
               named_cert_p->output_name_override.clear();
@@ -1625,6 +1639,9 @@ namespace nvhttp {
           auto named_cert_p = std::make_shared<crypto::named_cert_t>();
           named_cert_p->name = el.value("name", "");
           named_cert_p->cert = el.value("cert", "");
+          // Always derive from the certificate. This migrates old state and
+          // repairs any persisted fingerprint that conflicts with cert SPKI.
+          repair_named_device_spki_fingerprint(*named_cert_p);
           named_cert_p->uuid = el.value("uuid", "");
           named_cert_p->display_mode = el.value("display_mode", "");
           named_cert_p->hdr_profile = el.value("hdr_profile", "");
@@ -1695,21 +1712,25 @@ namespace nvhttp {
       }
     }
 
-    void add_authorized_client(const p_named_cert_t &named_cert_p) {
-      {
-        std::lock_guard<std::mutex> lock(client_mutex);
-        client_root.named_devices.push_back(named_cert_p);
-      }
-
+    void finalize_authorized_client_add(const p_named_cert_t &named_cert_p) {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
       system_tray::update_tray_paired(named_cert_p->name);
 #endif
-
-
       if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
         save_state();
         load_state();
       }
+    }
+
+    void add_authorized_client(const p_named_cert_t &named_cert_p) {
+      if (named_cert_p) {
+        repair_named_device_spki_fingerprint(*named_cert_p);
+      }
+      {
+        std::lock_guard<std::mutex> lock(client_mutex);
+        client_root.named_devices.push_back(named_cert_p);
+      }
+      finalize_authorized_client_add(named_cert_p);
     }
 
 
@@ -1718,121 +1739,25 @@ namespace nvhttp {
       std::string name;
     };
 
-    std::mutex tls_client_identity_mutex;
-    std::unordered_map<std::string, resolved_client_identity_t> tls_client_identity_by_endpoint;
-
-    std::string endpoint_key(req_https_t request) {
+    peer_auth_context_ptr peer_auth_for_request(const req_https_t &request) {
       if (!request) {
         return {};
       }
-
-      const auto endpoint = request->remote_endpoint();
-      if (endpoint.address().is_unspecified() || endpoint.port() == 0) {
-        return {};
-      }
-
-      return endpoint.address().to_string() + ":" + std::to_string(endpoint.port());
+      return std::static_pointer_cast<const peer_auth_context_t>(request->connection_user_data());
     }
 
-    std::optional<resolved_client_identity_t> resolve_client_identity_from_peer_cert(const crypto::x509_t &client_cert) {
-      if (!client_cert) {
-        BOOST_LOG(debug) << "No client certificate available";
-        return std::nullopt;
-      }
-
-      const auto client_cert_signature = crypto::signature(client_cert.get());
-
-      std::lock_guard<std::mutex> lock(client_mutex);
-      for (const auto &named_cert : client_root.named_devices) {
-        if (!named_cert) {
-          continue;
-        }
-
-        auto stored_x509 = crypto::x509(named_cert->cert);
-        if (!stored_x509) {
-          continue;
-        }
-
-        const auto stored_signature = crypto::signature(stored_x509.get());
-        if (stored_signature == client_cert_signature) {
-          BOOST_LOG(debug) << "Found matching client UUID: " << named_cert->uuid << " for client: " << named_cert->name;
-          return resolved_client_identity_t {
-            named_cert->uuid,
-            named_cert->name,
-          };
-        }
-      }
-
-      BOOST_LOG(debug) << "No matching client UUID found for certificate";
-      return std::nullopt;
-    }
-
-    void remember_tls_client_identity(req_https_t request, const resolved_client_identity_t &identity) {
-      const auto key = endpoint_key(request);
-      if (key.empty() || identity.uuid.empty()) {
-        return;
-      }
-
-      std::lock_guard<std::mutex> lock(tls_client_identity_mutex);
-      tls_client_identity_by_endpoint[key] = identity;
-    }
-
-    void forget_tls_client_identity(req_https_t request) {
-      const auto key = endpoint_key(request);
-      if (key.empty()) {
-        return;
-      }
-
-      std::lock_guard<std::mutex> lock(tls_client_identity_mutex);
-      tls_client_identity_by_endpoint.erase(key);
-    }
-
-    std::optional<resolved_client_identity_t> get_remembered_tls_client_identity(req_https_t request) {
-      const auto key = endpoint_key(request);
-      if (key.empty()) {
-        return std::nullopt;
-      }
-
-      std::lock_guard<std::mutex> lock(tls_client_identity_mutex);
-      const auto it = tls_client_identity_by_endpoint.find(key);
-      if (it == tls_client_identity_by_endpoint.end()) {
-        return std::nullopt;
-      }
-
-      return it->second;
-    }
-
-    void reset_peer_auth_context() {
-      tl_peer_auth_context = {};
-    }
-
-    void store_peer_auth_context(const crypto::x509_t &cert) {
-      tl_peer_auth_context.fingerprint = cert ? crypto::spki_sha256_fingerprint(cert) : std::string();
-      tl_peer_auth_context.cert_pem = cert ? crypto::pem(const_cast<crypto::x509_t &>(cert)) : std::string();
-      tl_peer_auth_context.valid_tls_cert = cert != nullptr;
-    }
-
-    direct_auth::DeviceTrustState classify_current_peer() {
-      const auto &peer = tl_peer_auth_context;
-      if (!peer.valid_tls_cert || peer.fingerprint.empty()) {
+    direct_auth::DeviceTrustState classify_peer_auth(const peer_auth_context_ptr &peer) {
+      if (!peer || !peer->valid_tls_cert || peer->fingerprint.empty()) {
         return direct_auth::DeviceTrustState::Unknown;
       }
 
       const auto client = client_root_snapshot();
-      return direct_auth_manager.classify(peer.fingerprint, peer.cert_pem, [&](const std::string &cert_pem) {
-        return direct_auth::cert_matches_any_named_device(cert_pem, client.named_devices);
+      return direct_auth_manager.classify(peer->fingerprint, peer->cert_pem, [&](const std::string &fingerprint) {
+        return direct_auth::cert_matches_any_named_device(fingerprint, client.named_devices);
       });
     }
 
-    std::string current_peer_fingerprint() {
-      return tl_peer_auth_context.fingerprint;
-    }
-
-    std::string current_peer_cert_pem() {
-      return tl_peer_auth_context.cert_pem;
-    }
-
-    std::string current_peer_source_ip(req_https_t request) {
+    std::string peer_source_ip(req_https_t request) {
       if (!request) {
         return {};
       }
@@ -1846,22 +1771,8 @@ namespace nvhttp {
     // Vibe Direct Auth v1 lets unknown-but-TLS-present devices reach only the
     // dedicated enrollment endpoints. Trusted devices also retain their existing
     // permission checks inside the Moonlight handlers.
-    bool is_direct_auth_public_path(std::string_view path) {
-      // The normative contract permits unknown certificates only on these three
-      // endpoints. /direct/v1/probe is trusted-only and must not be listed here.
-      return path == "/direct/v1/status" ||
-             path == "/direct/v1/enroll/request" ||
-             path == "/direct/v1/enroll/status";
-    }
-
     bool direct_auth_requires_trusted(std::string_view path) {
-      if (path == "/serverinfo" || path == "/pair" || path == "/unpair") {
-        return false;
-      }
-      if (is_direct_auth_public_path(path)) {
-        return false;
-      }
-      return true;
+      return direct_auth::route_requires_trusted_client(path);
     }
 
     void write_json_response(
@@ -1921,32 +1832,6 @@ namespace nvhttp {
       }
     }
 
-    bool read_json_body(req_https_t request, nlohmann::json &body, std::string *error_code = nullptr) {
-      if (!request) {
-        if (error_code) *error_code = "MALFORMED";
-        return false;
-      }
-      if (request->content.size() > direct_auth::MAX_BODY_BYTES) {
-        if (error_code) *error_code = "BODY_TOO_LARGE";
-        return false;
-      }
-      try {
-        body = nlohmann::json::parse(request->content.string());
-      } catch (const std::exception &) {
-        if (error_code) *error_code = "MALFORMED";
-        return false;
-      }
-      if (!body.is_object()) {
-        if (error_code) *error_code = "MALFORMED";
-        return false;
-      }
-      if (body.value("protocol", 0) != 1) {
-        if (error_code) *error_code = "UNSUPPORTED_VERSION";
-        return false;
-      }
-      return true;
-    }
-
     std::string direct_auth_setup_host(req_https_t request) {
       // The setup link must use an endpoint the enrolling client can actually
       // reach. The configured display name is not necessarily routable, so we
@@ -1963,7 +1848,8 @@ namespace nvhttp {
     }
 
     nlohmann::json direct_auth_status_payload(req_https_t request) {
-      const auto peer_fingerprint = current_peer_fingerprint();
+      const auto peer_auth = peer_auth_for_request(request);
+      const auto peer_fingerprint = peer_auth ? peer_auth->fingerprint : std::string();
       const auto enrollment = direct_auth_manager.enrollment_status();
 
       nlohmann::json enrollment_json = {
@@ -1982,9 +1868,11 @@ namespace nvhttp {
         {"host_uuid", http::unique_id},
         {"host_fingerprint", host_fingerprint_or_empty()},
         {"client_fingerprint", peer_fingerprint},
-        {"auth_state", direct_auth_state_string(classify_current_peer())},
+        {"auth_state", direct_auth_state_string(classify_peer_auth(peer_auth))},
+        {"base_port", net::map_port(nvhttp::PORT_HTTP)},
+        {"https_port", net::map_port(nvhttp::PORT_HTTPS)},
         {"enrollment", enrollment_json},
-        {"legacy_pin_pairing_enabled", false},
+        {"legacy_pin_pairing_enabled", config::sunshine.enable_pairing},
       };
     }
 
@@ -1993,8 +1881,8 @@ namespace nvhttp {
       write_json_response(response, SimpleWeb::StatusCode::success_ok, direct_auth_status_payload(request), true);
     }
 
-    void direct_auth_probe(resp_https_t response, req_https_t request) {
-      if (classify_current_peer() != direct_auth::DeviceTrustState::Trusted) {
+    void direct_auth_probe(resp_https_t response, req_https_t request, const peer_auth_context_ptr &peer_auth) {
+      if (classify_peer_auth(peer_auth) != direct_auth::DeviceTrustState::Trusted) {
         write_direct_error(response, SimpleWeb::StatusCode::client_error_forbidden, "UNAUTHORIZED", "Direct Auth probe requires a trusted client certificate.");
         return;
       }
@@ -2011,51 +1899,54 @@ namespace nvhttp {
     }
 
     void direct_auth_enroll_request(resp_https_t response, req_https_t request) {
-      nlohmann::json body;
+      direct_auth::EnrollmentRequestFields fields;
       std::string error_code;
-      if (!read_json_body(request, body, &error_code)) {
-        const auto &code = error_code == "BODY_TOO_LARGE" ? "BODY_TOO_LARGE" : "MALFORMED";
+      if (!request) {
+        error_code = "MALFORMED";
+      }
+      else if (request->content.size() > direct_auth::MAX_BODY_BYTES) {
+        error_code = "BODY_TOO_LARGE";
+      }
+      else if (!direct_auth::parse_enrollment_request_body(request->content.string(), fields, error_code)) {
+        // The parser owns the JSON/type exception firewall and returns only a
+        // bounded machine-readable protocol error code.
+      }
+      if (!error_code.empty()) {
+        const auto &code = error_code.empty() ? std::string("MALFORMED") : error_code;
         write_direct_error(response, SimpleWeb::StatusCode::client_error_bad_request, code, "Invalid Direct Auth request.");
         return;
       }
 
-      const auto actual_fingerprint = current_peer_fingerprint();
+      const auto peer_auth = peer_auth_for_request(request);
+      const auto actual_fingerprint = peer_auth ? peer_auth->fingerprint : std::string();
       if (actual_fingerprint.empty()) {
         write_direct_error(response, SimpleWeb::StatusCode::client_error_forbidden, "UNAUTHORIZED", "A client certificate is required.");
         return;
       }
 
-      const auto enrollment_id = body.value("enrollment_id", std::string());
-      const auto body_fingerprint = body.value("client_fingerprint", std::string());
-      const auto client_name = body.value("client_name", std::string());
-      const auto client_uuid = body.value("client_uuid", std::string());
-      const auto proof = body.value("proof", std::string());
-
-      if (!body.contains("enrollment_id") || !body.contains("client_fingerprint") ||
-          !body.contains("client_name") || !body.contains("client_uuid") || !body.contains("proof")) {
-        write_direct_error(response, SimpleWeb::StatusCode::client_error_bad_request, "MALFORMED", "Missing Direct Auth enrollment fields.");
-        return;
-      }
-
-      if (classify_current_peer() != direct_auth::DeviceTrustState::Unknown) {
+      const auto peer_state = classify_peer_auth(peer_auth);
+      if (peer_state != direct_auth::DeviceTrustState::Unknown) {
         // A blocked/revoked/trusted device cannot consume a public enrollment
         // window. Blocked/revoked devices stay silent; trusted devices should
         // use normal GameStream routes.
-        write_direct_error(response, SimpleWeb::StatusCode::client_error_forbidden, "UNAUTHORIZED", "Enrollment is only available to an unknown device.");
+        const auto code = peer_state == direct_auth::DeviceTrustState::Blocked ? "DEVICE_BLOCKED" :
+                          peer_state == direct_auth::DeviceTrustState::Revoked ? "DEVICE_REVOKED" :
+                                                                                "UNAUTHORIZED";
+        write_direct_error(response, SimpleWeb::StatusCode::client_error_forbidden, code, "Enrollment is not available to this device.");
         return;
       }
 
       std::string pending_id;
       std::string manager_error;
       const bool created = direct_auth_manager.submit_enrollment_request(
-        enrollment_id,
-        body_fingerprint,
-        client_name,
-        client_uuid,
-        proof,
+        fields.enrollment_id,
+        fields.client_fingerprint,
+        fields.client_name,
+        fields.client_uuid,
+        fields.proof,
         actual_fingerprint,
-        current_peer_cert_pem(),
-        current_peer_source_ip(request),
+        peer_auth ? peer_auth->cert_pem : std::string(),
+        peer_source_ip(request),
         &pending_id,
         &manager_error
       );
@@ -2063,7 +1954,10 @@ namespace nvhttp {
       if (!created) {
         const auto &code = manager_error.empty() ? "ENROLLMENT_INVALID_PROOF" : manager_error;
         auto status = SimpleWeb::StatusCode::client_error_forbidden;
-        if (code == "ENROLLMENT_CLOSED") {
+        if (code == "INTERNAL_ERROR") {
+          status = SimpleWeb::StatusCode::server_error_internal_server_error;
+        }
+        else if (code == "ENROLLMENT_CLOSED") {
           status = SimpleWeb::StatusCode::client_error_forbidden;
         }
         else if (code == "ENROLLMENT_PENDING" || code == "RATE_LIMITED") {
@@ -2088,14 +1982,21 @@ namespace nvhttp {
     }
 
     void direct_auth_enroll_status(resp_https_t response, req_https_t request) {
+      direct_auth_manager.expire_stale();
       auto args = request->parse_query_string();
-      const auto pending_id = get_arg(args, "pending_id", "");
-      if (pending_id.empty()) {
-        write_direct_error(response, SimpleWeb::StatusCode::client_error_bad_request, "MALFORMED", "Missing pending_id.");
+      std::vector<std::string> pending_id_values;
+      const auto [pending_begin, pending_end] = args.equal_range("pending_id");
+      for (auto it = pending_begin; it != pending_end; ++it) {
+        pending_id_values.push_back(it->second);
+      }
+      std::string pending_id;
+      if (!direct_auth::parse_pending_id_query_values(pending_id_values, pending_id)) {
+        write_direct_error(response, SimpleWeb::StatusCode::client_error_bad_request, "MALFORMED", "Invalid pending_id.");
         return;
       }
 
-      const auto fingerprint = current_peer_fingerprint();
+      const auto peer_auth = peer_auth_for_request(request);
+      const auto fingerprint = peer_auth ? peer_auth->fingerprint : std::string();
       if (fingerprint.empty()) {
         write_direct_error(response, SimpleWeb::StatusCode::client_error_forbidden, "UNAUTHORIZED", "A client certificate is required.");
         return;
@@ -2187,11 +2088,7 @@ namespace nvhttp {
       return {};
     }
 
-    resolved_client_identity_t resolve_client_identity(req_https_t request, const verified_client_t &verified_client) {
-      if (auto remembered = get_remembered_tls_client_identity(request)) {
-        return *remembered;
-      }
-
+    resolved_client_identity_t resolve_client_identity(const verified_client_t &verified_client) {
       resolved_client_identity_t identity;
       if (verified_client) {
         identity.uuid = verified_client->uuid;
@@ -2806,29 +2703,18 @@ namespace nvhttp {
     };
 
     inline verified_client_t get_verified_cert(req_https_t request) {
-      if (auto remembered = get_remembered_tls_client_identity(request)) {
-        std::lock_guard<std::mutex> lock(client_mutex);
-        for (const auto &named_cert_p : client_root.named_devices) {
-          if (named_cert_p && named_cert_p->uuid == remembered->uuid) {
-            return *named_cert_p;
-          }
-        }
-      }
-
-      if (!tl_peer_certificate) {
+      const auto peer_auth = peer_auth_for_request(request);
+      if (!peer_auth || classify_peer_auth(peer_auth) != direct_auth::DeviceTrustState::Trusted) {
         return std::nullopt;
       }
 
-      const auto peer_signature = crypto::signature(tl_peer_certificate.get());
+      if (peer_auth->fingerprint.empty()) {
+        return std::nullopt;
+      }
       std::lock_guard<std::mutex> lock(client_mutex);
-      for (const auto &named_cert_p : client_root.named_devices) {
-        if (!named_cert_p) {
-          continue;
-        }
-        auto stored_x509 = crypto::x509(named_cert_p->cert);
-        if (stored_x509 && crypto::signature(stored_x509.get()) == peer_signature) {
-          return *named_cert_p;
-        }
+      if (const auto named_cert_p = direct_auth::find_named_device_by_fingerprint(peer_auth->fingerprint, client_root.named_devices)) {
+        repair_named_device_spki_fingerprint(*named_cert_p);
+        return *named_cert_p;
       }
       return std::nullopt;
     }
@@ -3559,7 +3445,7 @@ namespace nvhttp {
       bool is_input_only = config::input.enable_input_only_mode && (appid == proc::input_only_app_id || (appuuid_str == REMOTE_INPUT_UUID));
 
       auto verified_client = get_verified_cert(request);
-      const auto request_client_identity = resolve_client_identity(request, verified_client);
+      const auto request_client_identity = resolve_client_identity(verified_client);
       auto required_perm = PERM::launch;
 
       BOOST_LOG(verbose) << "Launching app [" << appid_str << "] with UUID [" << appuuid_str << "]";
@@ -4073,7 +3959,7 @@ namespace nvhttp {
     });
 
     auto verified_client = get_verified_cert(request);
-    const auto request_client_identity = resolve_client_identity(request, verified_client);
+    const auto request_client_identity = resolve_client_identity(verified_client);
     if (!has_client_perm(verified_client, PERM::_allow_view)) {
       log_permission_denied("ViewApp"sv, "View stream"sv, verified_client);
 
@@ -4818,10 +4704,6 @@ namespace nvhttp {
 
     // Verify certificates after establishing connection
     https_server.verify = [](req_https_t req, SSL *ssl) {
-      tl_peer_certificate.reset();
-      reset_peer_auth_context();
-      forget_tls_client_identity(req);
-
       crypto::x509_t x509_verify {
 #if OPENSSL_VERSION_MAJOR >= 3
         SSL_get1_peer_certificate(ssl)
@@ -4853,16 +4735,17 @@ namespace nvhttp {
         return false;
       }
 
-      store_peer_auth_context(x509_verify);
-
-      // Existing paired clients also get remembered by UUID for the legacy
-      // Moonlight handlers. Unknown clients are intentionally not remembered.
-      if (auto identity = resolve_client_identity_from_peer_cert(x509_verify)) {
-        remember_tls_client_identity(req, *identity);
+      const auto peer_auth = std::make_shared<const peer_auth_context_t>(peer_auth_context_t {
+        .fingerprint = fingerprint,
+        .cert_pem = pem,
+        .valid_tls_cert = true,
+      });
+      if (!req || !req->set_connection_user_data(peer_auth)) {
+        BOOST_LOG(warning) << subject_name << " -- unable to bind TLS client identity to its connection -- denied";
+        return false;
       }
 
-      tl_peer_certificate = std::move(x509_verify);
-      BOOST_LOG(verbose) << subject_name << " -- accepted for direct-auth route gating";
+      BOOST_LOG(verbose) << subject_name << " -- accepted with connection-bound direct-auth identity";
       return true;
     };
 
@@ -4903,22 +4786,29 @@ namespace nvhttp {
 
     // Route-aware Vibe Direct Auth v1 authorization. Direct public onboarding
     // paths can be reached by unknown certificates; every other HTTPS route is
-    // trusted-only and gets a cheap DirectAuth 401 before entering Moonlight
+    // trusted-only and gets a cheap DirectAuth 403 before entering Moonlight
     // handlers (which retain their existing per-permission checks).
     const auto direct_https_gate = [](const auto &handler) {
       return [handler](resp_https_t response, req_https_t request) mutable {
-        if (classify_current_peer() != direct_auth::DeviceTrustState::Trusted) {
-          write_direct_error(response, SimpleWeb::StatusCode::client_error_forbidden, "UNAUTHORIZED", "This endpoint requires a trusted client certificate.");
+        const auto peer_auth = peer_auth_for_request(request);
+        const auto peer_state = classify_peer_auth(peer_auth);
+        if (peer_state != direct_auth::DeviceTrustState::Trusted) {
+          const auto code = peer_state == direct_auth::DeviceTrustState::Blocked ? "DEVICE_BLOCKED" :
+                            peer_state == direct_auth::DeviceTrustState::Revoked ? "DEVICE_REVOKED" :
+                                                                                  "UNAUTHORIZED";
+          write_direct_error(response, SimpleWeb::StatusCode::client_error_forbidden, code, "This endpoint requires an authorized client certificate.");
           return;
         }
-        handler(std::move(response), std::move(request));
+        handler(std::move(response), std::move(request), peer_auth);
       };
     };
 
     https_server.default_resource["GET"] = not_found<SunshineHTTPS>;
     https_server.default_resource["POST"] = not_found<SunshineHTTPS>;
     https_server.resource["^/serverinfo$"]["GET"] = [run_discovery_nvhttp](auto resp, auto req) {
-      run_discovery_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
+      auto peer_auth = peer_auth_for_request(req);
+      run_discovery_nvhttp([resp = std::move(resp), req = std::move(req), peer_auth = std::move(peer_auth)]() mutable {
+        (void) peer_auth;
         serverinfo<SunshineHTTPS>(std::move(resp), std::move(req));
       });
     };
@@ -4926,15 +4816,11 @@ namespace nvhttp {
     https_server.resource["^/pair/?$"]["POST"] = pair<SunshineHTTPS>;
     https_server.resource["^/unpair/?$"]["GET"] = unpair<SunshineHTTPS>;
     https_server.resource["^/unpair/?$"]["POST"] = unpair<SunshineHTTPS>;
-    // Direct Auth endpoints must run inline on the HTTPS io thread: the TLS
-    // verify callback has already stored this connection's peer fingerprint in
-    // the thread-local peer-auth context, and dispatching to another worker pool
-    // would lose that context.
     https_server.resource["^/direct/v1/status$"]["GET"] = [](auto resp, auto req) {
       direct_auth_status(std::move(resp), std::move(req));
     };
-    https_server.resource["^/direct/v1/probe$"]["GET"] = direct_https_gate([](resp_https_t resp, req_https_t req) {
-      direct_auth_probe(std::move(resp), std::move(req));
+    https_server.resource["^/direct/v1/probe$"]["GET"] = direct_https_gate([](resp_https_t resp, req_https_t req, const peer_auth_context_ptr &peer_auth) {
+      direct_auth_probe(std::move(resp), std::move(req), peer_auth);
     });
     https_server.resource["^/direct/v1/enroll/request$"]["POST"] = [](auto resp, auto req) {
       direct_auth_enroll_request(std::move(resp), std::move(req));
@@ -4942,16 +4828,18 @@ namespace nvhttp {
     https_server.resource["^/direct/v1/enroll/status$"]["GET"] = [](auto resp, auto req) {
       direct_auth_enroll_status(std::move(resp), std::move(req));
     };
-    https_server.resource["^/applist$"]["GET"] = direct_https_gate([run_discovery_nvhttp](auto resp, auto req) {
-      run_discovery_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
+    https_server.resource["^/applist$"]["GET"] = direct_https_gate([run_discovery_nvhttp](auto resp, auto req, auto peer_auth) {
+      run_discovery_nvhttp([resp = std::move(resp), req = std::move(req), peer_auth = std::move(peer_auth)]() mutable {
+        (void) peer_auth;
         applist(std::move(resp), std::move(req));
       });
     });
-    https_server.resource["^/appasset$"]["GET"] = direct_https_gate([](auto resp, auto req) {
+    https_server.resource["^/appasset$"]["GET"] = direct_https_gate([](auto resp, auto req, auto) {
       appasset(std::move(resp), std::move(req));
     });
-    https_server.resource["^/launch$"]["GET"] = direct_https_gate([&host_audio, run_blocking_nvhttp](auto resp, auto req) {
-      run_blocking_nvhttp([&host_audio, resp = std::move(resp), req = std::move(req)]() mutable {
+    https_server.resource["^/launch$"]["GET"] = direct_https_gate([&host_audio, run_blocking_nvhttp](auto resp, auto req, auto peer_auth) {
+      run_blocking_nvhttp([&host_audio, resp = std::move(resp), req = std::move(req), peer_auth = std::move(peer_auth)]() mutable {
+        (void) peer_auth;
         std::lock_guard launch_lock {launch_request_mutex};
         (void) proc::proc.running();
         std::lock_guard lifecycle_lock {stream_lifecycle_gate};
@@ -4959,8 +4847,9 @@ namespace nvhttp {
         launch(host_audio, std::move(resp), std::move(req), current_appid);
       });
     });
-    https_server.resource["^/resume$"]["GET"] = direct_https_gate([&host_audio, run_blocking_nvhttp](auto resp, auto req) {
-      run_blocking_nvhttp([&host_audio, resp = std::move(resp), req = std::move(req)]() mutable {
+    https_server.resource["^/resume$"]["GET"] = direct_https_gate([&host_audio, run_blocking_nvhttp](auto resp, auto req, auto peer_auth) {
+      run_blocking_nvhttp([&host_audio, resp = std::move(resp), req = std::move(req), peer_auth = std::move(peer_auth)]() mutable {
+        (void) peer_auth;
         std::lock_guard launch_lock {launch_request_mutex};
         (void) proc::proc.running();
         std::lock_guard lifecycle_lock {stream_lifecycle_gate};
@@ -4968,22 +4857,23 @@ namespace nvhttp {
         resume(host_audio, std::move(resp), std::move(req), current_appid);
       });
     });
-    https_server.resource["^/cancel$"]["GET"] = direct_https_gate([run_blocking_nvhttp](auto resp, auto req) {
-      run_blocking_nvhttp([resp = std::move(resp), req = std::move(req)]() mutable {
+    https_server.resource["^/cancel$"]["GET"] = direct_https_gate([run_blocking_nvhttp](auto resp, auto req, auto peer_auth) {
+      run_blocking_nvhttp([resp = std::move(resp), req = std::move(req), peer_auth = std::move(peer_auth)]() mutable {
+        (void) peer_auth;
         std::lock_guard lock {launch_request_mutex};
         cancel(std::move(resp), std::move(req));
       });
     });
-    https_server.resource["^/actions/clipboard$"]["GET"] = direct_https_gate([](auto resp, auto req) {
+    https_server.resource["^/actions/clipboard$"]["GET"] = direct_https_gate([](auto resp, auto req, auto) {
       getClipboard(std::move(resp), std::move(req));
     });
-    https_server.resource["^/actions/clipboard$"]["POST"] = direct_https_gate([](auto resp, auto req) {
+    https_server.resource["^/actions/clipboard$"]["POST"] = direct_https_gate([](auto resp, auto req, auto) {
       setClipboard(std::move(resp), std::move(req));
     });
-    https_server.resource["^/bitrate$"]["GET"] = direct_https_gate([](auto resp, auto req) {
+    https_server.resource["^/bitrate$"]["GET"] = direct_https_gate([](auto resp, auto req, auto) {
       setBitrate(std::move(resp), std::move(req));
     });
-    https_server.resource["^/api/abr/capabilities$"]["GET"] = direct_https_gate([](auto resp, auto req) {
+    https_server.resource["^/api/abr/capabilities$"]["GET"] = direct_https_gate([](auto resp, auto req, auto) {
       getAbrCapabilities(std::move(resp), std::move(req));
     });
 
@@ -5378,12 +5268,16 @@ namespace nvhttp {
     };
   }
 
-  nlohmann::json direct_auth_open_enrollment(const std::string &host, std::uint16_t https_port, std::int64_t ttl_ms) {
-    if (host.empty() || https_port == 0) {
-      return {{"status", false}, {"error", "Missing host or https_port"}};
+  nlohmann::json direct_auth_open_enrollment(const std::string &host, std::int64_t ttl_ms) {
+    if (!direct_auth::valid_setup_host(host)) {
+      return {{"status", false}, {"error", "Invalid client-reachable host"}};
     }
 
-    const auto enrollment = direct_auth_manager.open_enrollment(host, https_port, host_fingerprint(), ttl_ms);
+    const auto direct_https_port = static_cast<std::uint16_t>(net::map_port(nvhttp::PORT_HTTPS));
+    const auto enrollment = direct_auth_manager.open_enrollment(host, direct_https_port, host_fingerprint(), ttl_ms);
+    if (enrollment.state != direct_auth::EnrollmentState::Open || enrollment.enrollment_id.empty() || enrollment.setup_uri.empty()) {
+      return {{"status", false}, {"error", "Unable to generate secure enrollment token"}};
+    }
     nlohmann::json result = {
       {"status", true},
       {"enrollment", {
@@ -5403,10 +5297,15 @@ namespace nvhttp {
 
   bool direct_auth_accept_pending(const std::string &pending_id) {
     return direct_auth_manager.accept_pending(pending_id, [](const direct_auth::PendingInfo &info) {
+      std::lock_guard<std::mutex> trust_transition_lock(direct_auth_trust_transition_mutex);
+      if (direct_auth_manager.is_blocked_or_revoked(info.fingerprint)) {
+        return false;
+      }
+
       auto named_cert_p = std::make_shared<crypto::named_cert_t>();
       named_cert_p->name = info.name.empty() ? "Direct Auth Device" : info.name;
-      named_cert_p->uuid = info.uuid.empty() ? uuid_util::uuid_t::generate().string() : info.uuid;
       named_cert_p->cert = info.cert_pem;
+      named_cert_p->spki_fingerprint = info.fingerprint;
       named_cert_p->display_mode = "";
       named_cert_p->output_name_override.clear();
       named_cert_p->perm = PERM::_default;
@@ -5417,12 +5316,20 @@ namespace nvhttp {
 
       {
         std::lock_guard<std::mutex> lock(client_mutex);
+        named_cert_p->uuid = direct_auth::generate_unique_named_device_uuid(
+          client_root.named_devices,
+          [] { return uuid_util::uuid_t::generate().string(); }
+        );
+        if (named_cert_p->uuid.empty()) {
+          return false;
+        }
         if (client_root.named_devices.empty()) {
           named_cert_p->perm = PERM::_all;
         }
+        client_root.named_devices.push_back(named_cert_p);
       }
 
-      add_authorized_client(named_cert_p);
+      finalize_authorized_client_add(named_cert_p);
       return true;
     });
   }
@@ -5435,57 +5342,43 @@ namespace nvhttp {
     return denied;
   }
 
-  bool direct_auth_block_fingerprint(const std::string &fingerprint, const std::string &reason, const std::string &name, const std::string &uuid) {
-    if (fingerprint.empty()) {
-      return false;
-    }
-    direct_auth_manager.block_fingerprint(fingerprint, reason.empty() ? "denied" : reason, name, uuid);
-    if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
-      save_state();
-    }
-    return true;
-  }
-
-  bool direct_auth_revoke_fingerprint(const std::string &fingerprint) {
+  bool block_or_revoke_direct_auth_fingerprint(
+    const std::string &fingerprint,
+    const std::string &reason,
+    const std::string &name,
+    const std::string &uuid
+  ) {
     if (fingerprint.empty()) {
       return false;
     }
 
     std::vector<std::string> disconnected_uuids;
     {
-      std::lock_guard<std::mutex> lock(client_mutex);
-      for (auto it = client_root.named_devices.begin(); it != client_root.named_devices.end();) {
-        const auto &named_cert = *it;
-        if (!named_cert) {
-          ++it;
-          continue;
-        }
-        auto cert = crypto::x509(named_cert->cert);
-        const auto stored_fingerprint = cert ? crypto::spki_sha256_fingerprint(cert) : std::string();
-        if (!stored_fingerprint.empty() && stored_fingerprint == fingerprint) {
-          disconnected_uuids.push_back(named_cert->uuid);
-          it = client_root.named_devices.erase(it);
-        } else {
-          ++it;
-        }
+      std::lock_guard<std::mutex> trust_transition_lock(direct_auth_trust_transition_mutex);
+      {
+        std::lock_guard<std::mutex> lock(client_mutex);
+        disconnected_uuids = direct_auth::remove_named_devices_by_fingerprint(fingerprint, client_root.named_devices);
       }
+      direct_auth_manager.block_fingerprint(fingerprint, reason.empty() ? "denied" : reason, name, uuid);
     }
-
-    direct_auth_manager.revoke_fingerprint(fingerprint);
 
     if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
       save_state();
       load_state();
     }
 
-    // Take the snapshot of active sessions before tearing down. The registry
-    // functions perform normal session teardown and must not be called while
-    // client_mutex is held.
-    for (const auto &uuid : disconnected_uuids) {
-      disconnect_client(uuid);
+    for (const auto &disconnected_uuid : disconnected_uuids) {
+      disconnect_client(disconnected_uuid);
     }
-
     return true;
+  }
+
+  bool direct_auth_block_fingerprint(const std::string &fingerprint, const std::string &reason, const std::string &name, const std::string &uuid) {
+    return block_or_revoke_direct_auth_fingerprint(fingerprint, reason.empty() ? "denied" : reason, name, uuid);
+  }
+
+  bool direct_auth_revoke_fingerprint(const std::string &fingerprint) {
+    return block_or_revoke_direct_auth_fingerprint(fingerprint, "revoked", {}, {});
   }
 
   bool direct_auth_unblock_fingerprint(const std::string &fingerprint) {

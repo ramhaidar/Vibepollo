@@ -2877,10 +2877,9 @@ namespace confighttp {
     try {
       nlohmann::json input_tree = nlohmann::json::parse(request->content.string());
       const auto host = input_tree.value("host", std::string());
-      const auto https_port = input_tree.value("https_port", static_cast<uint16_t>(net::map_port(nvhttp::PORT_HTTPS)));
       const auto ttl_ms = input_tree.value("ttl_ms", static_cast<std::int64_t>(direct_auth::ENROLLMENT_TTL_MS));
 
-      auto output_tree = nvhttp::direct_auth_open_enrollment(host, https_port, ttl_ms);
+      auto output_tree = nvhttp::direct_auth_open_enrollment(host, ttl_ms);
       send_response(response, std::move(output_tree), "no-store");
     } catch (const std::exception &e) {
       BOOST_LOG(warning) << "OpenDirectAuthEnrollment: "sv << e.what();

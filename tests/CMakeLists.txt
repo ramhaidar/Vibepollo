@@ -144,6 +144,12 @@ endforeach()
 set(SUNSHINE_TEST_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 file(MAKE_DIRECTORY "${SUNSHINE_TEST_GENERATED_INCLUDE_DIR}")
 
+include("${SUNSHINE_TEST_REPOSITORY_ROOT}/cmake/dependencies/simple_web_server_peer_context.cmake")
+sunshine_prepare_simple_web_server_peer_context(
+    "${SUNSHINE_TEST_REPOSITORY_ROOT}"
+    "${CMAKE_CURRENT_BINARY_DIR}"
+    SUNSHINE_TEST_SIMPLE_WEB_SERVER_OVERLAY)
+
 # Resource contracts are captured at configure time.  The resulting test has
 # no filesystem, JSON-parser, or production file-handler dependency at runtime.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
@@ -195,6 +201,8 @@ find_package(OpenSSL REQUIRED)
 # paths.  A component explicitly opts in to the one external surface it uses;
 # this keeps edits in a vendored SDK from rebuilding unrelated test targets.
 add_library(sunshine_test_simple_web_headers INTERFACE)
+target_include_directories(sunshine_test_simple_web_headers BEFORE INTERFACE
+    "${SUNSHINE_TEST_SIMPLE_WEB_SERVER_OVERLAY}")
 target_include_directories(sunshine_test_simple_web_headers SYSTEM INTERFACE
     "${SUNSHINE_TEST_REPOSITORY_ROOT}/third-party")
 target_link_libraries(sunshine_test_simple_web_headers INTERFACE
@@ -392,7 +400,15 @@ sunshine_register_component(NAME test_component_direct_auth TEST_SOURCE unit/tes
     PRODUCT_SOURCES
         "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/direct_auth.cpp"
         "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/crypto.cpp"
-    LINK_LIBRARIES OpenSSL::Crypto)
+    LINK_LIBRARIES OpenSSL::Crypto $<$<PLATFORM_ID:Windows>:ws2_32>)
+sunshine_register_component(NAME test_component_tls_request_identity TEST_SOURCE unit/test_tls_request_identity.cpp
+    DEFINITIONS
+        "SUNSHINE_SOURCE_DIR=\"${SUNSHINE_TEST_REPOSITORY_ROOT}\""
+        "SUNSHINE_BUILD_DIR=\"${CMAKE_BINARY_DIR}\""
+    PRODUCT_SOURCES
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/direct_auth.cpp"
+        "${SUNSHINE_TEST_REPOSITORY_ROOT}/src/crypto.cpp"
+    LINK_LIBRARIES sunshine_test_simple_web_headers OpenSSL::Crypto ws2_32)
 sunshine_register_component(NAME test_component_encoder_probe_policy TEST_SOURCE unit/test_encoder_probe_policy.cpp)
 sunshine_register_component(NAME test_component_resource_config_catalog TEST_SOURCE unit/test_config_catalog_contract.cpp
     INCLUDE_DIRECTORIES "${SUNSHINE_TEST_GENERATED_INCLUDE_DIR}")

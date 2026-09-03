@@ -14,7 +14,14 @@ set(ENET_NO_INSTALL ON CACHE BOOL "Don't install any libraries built for enet")
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet")
 
 # web server
+include(dependencies/simple_web_server_peer_context)
+sunshine_prepare_simple_web_server_peer_context(
+    "${CMAKE_SOURCE_DIR}"
+    "${CMAKE_BINARY_DIR}"
+    SUNSHINE_SIMPLE_WEB_SERVER_OVERLAY)
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/Simple-Web-Server")
+target_include_directories(simple-web-server BEFORE INTERFACE
+    "${SUNSHINE_SIMPLE_WEB_SERVER_OVERLAY}")
 
 # libdisplaydevice
 add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/libdisplaydevice")

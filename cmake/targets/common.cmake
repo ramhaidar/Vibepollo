@@ -6,6 +6,10 @@ if(APPLE AND NOT SUNSHINE_BUILD_HOMEBREW)
 else()
     add_executable(sunshine ${SUNSHINE_TARGET_FILES})
 endif()
+if(SUNSHINE_SIMPLE_WEB_SERVER_OVERLAY)
+    target_include_directories(sunshine BEFORE PRIVATE
+        "${SUNSHINE_SIMPLE_WEB_SERVER_OVERLAY}")
+endif()
 foreach(dep ${SUNSHINE_TARGET_DEPENDENCIES})
     add_dependencies(sunshine ${dep})  # compile these before sunshine
 endforeach()

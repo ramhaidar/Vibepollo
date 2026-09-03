@@ -103,6 +103,9 @@ namespace crypto {
     std::string name;
     std::string uuid;
     std::string cert;
+    // Vibe Direct Auth durable identity. This is repaired from `cert` on load;
+    // certificate bytes remain for legacy GameStream pairing compatibility.
+    std::string spki_fingerprint;
     std::string display_mode;
     std::string hdr_profile;
     std::string output_name_override;
@@ -155,6 +158,12 @@ namespace crypto {
 
   std::string_view signature(const X509 *x);
   std::string_view signature(const x509_t &x);
+
+  /**
+   * @brief Fill a string with cryptographically secure random bytes.
+   * @return false when OpenSSL cannot provide randomness; `out` is cleared.
+   */
+  bool secure_random_bytes(std::size_t bytes, std::string &out);
 
   std::string rand(std::size_t bytes);
   std::string rand_alphabet(std::size_t bytes, const std::string_view &alphabet = std::string_view {"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!%&()=-"});

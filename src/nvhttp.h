@@ -407,9 +407,8 @@ namespace nvhttp {
   /**
    * @brief Open a Direct Auth enrollment window from an authenticated admin caller.
    * @param host The routable host/IP to embed in the setup URI.
-   * @param https_port The HTTPS port to embed in the setup URI.
    */
-  nlohmann::json direct_auth_open_enrollment(const std::string &host, std::uint16_t https_port, std::int64_t ttl_ms = direct_auth::ENROLLMENT_TTL_MS);
+  nlohmann::json direct_auth_open_enrollment(const std::string &host, std::int64_t ttl_ms = direct_auth::ENROLLMENT_TTL_MS);
 
   bool direct_auth_close_enrollment();
 

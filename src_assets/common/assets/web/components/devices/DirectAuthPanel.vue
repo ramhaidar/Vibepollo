@@ -72,6 +72,7 @@ const action = ref<PendingAction | null>(null);
 const revealFingerprint = ref('');
 const now = ref(Date.now());
 const openedUri = ref('');
+const reachableHost = ref('');
 let refreshTimer: number | undefined;
 let countdownTimer: number | undefined;
 
@@ -103,6 +104,21 @@ const enrollmentExpiresLabel = computed(() => {
 });
 
 const activeAction = computed(() => Boolean(action.value));
+
+function isLoopbackHost(value: string): boolean {
+  const host = value.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return host === 'localhost' || host === '::1' || host.startsWith('127.');
+}
+
+function defaultReachableHost(): string {
+  const host = window.location.hostname;
+  return host && !isLoopbackHost(host) ? host : '';
+}
+
+function validReachableHost(value: string): boolean {
+  const host = value.trim();
+  return host.length > 0 && host.length <= 255 && !/[\r\n\0]/.test(host);
+}
 
 function busy(kind: PendingAction['kind'], target?: string): boolean {
   return Boolean(
@@ -165,15 +181,14 @@ async function openEnrollment(): Promise<void> {
   notice.value = '';
   action.value = { kind: 'open', target: 'enrollment' };
   try {
-    // The admin browser's hostname/port are usually the correct control-plane
-    // endpoint the enrolling client should contact.
-    const httpsPort = window.location.port ? Number(window.location.port) : 47989;
+    if (!validReachableHost(reachableHost.value)) {
+      throw new Error(t('ui.devices.direct_auth.error.host_required'));
+    }
     const response = await apiPost<{
       status?: boolean;
       enrollment?: DirectAuthEnrollment;
     }>('/api/direct-auth/enrollment', {
-      host: window.location.hostname,
-      https_port: httpsPort,
+      host: reachableHost.value.trim(),
     });
     if (response.status !== true || !response.enrollment?.open) {
       throw new Error(t('ui.devices.direct_auth.error.open_rejected'));
@@ -287,6 +302,7 @@ function toggleReveal(fingerprint: string): void {
 }
 
 onMounted(() => {
+  reachableHost.value = defaultReachableHost();
   void load(true);
   countdownTimer = window.setInterval(() => {
     now.value = Date.now();
@@ -372,6 +388,22 @@ defineExpose({
         </div>
         <div v-else class="direct-auth__idle">
           <p>{{ t('ui.devices.direct_auth.idle_instructions') }}</p>
+          <label class="direct-auth__host-field">
+            <span>{{ t('ui.devices.direct_auth.reachable_host_label') }}</span>
+            <input
+              v-model="reachableHost"
+              type="text"
+              maxlength="255"
+              autocomplete="off"
+              :placeholder="t('ui.devices.direct_auth.reachable_host_placeholder')"
+            />
+          </label>
+          <span v-if="!reachableHost" class="direct-auth__muted">
+            {{ t('ui.devices.direct_auth.loopback_warning') }}
+          </span>
+          <div class="direct-auth__window-summary">
+            <span>{{ t('ui.devices.direct_auth.default_expiry', { minutes: '02', seconds: '00' }) }}</span>
+          </div>
           <AppButton
             :label="t('ui.devices.direct_auth.action.add_device')"
             icon="plus"
@@ -533,6 +565,21 @@ defineExpose({
 .direct-auth__idle {
   display: grid;
   gap: var(--vs-space-12);
+}
+
+.direct-auth__host-field {
+  display: grid;
+  gap: var(--vs-space-6);
+  max-width: 32rem;
+}
+
+.direct-auth__host-field input {
+  width: 100%;
+  padding: var(--vs-space-8) var(--vs-space-12);
+  border: 1px solid var(--vs-color-border-default);
+  border-radius: var(--vs-radius-control);
+  background: var(--vs-color-bg-default);
+  color: var(--vs-color-text-primary);
 }
 
 .direct-auth__window-summary,

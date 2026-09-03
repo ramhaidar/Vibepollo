@@ -2,10 +2,14 @@
  * @file src/crypto.cpp
  * @brief Definitions for cryptography functions.
  */
+// standard includes
+#include <limits>
+
 // lib includes
 #include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <openssl/rsa.h>
 
 // local includes
@@ -466,6 +470,22 @@ namespace crypto {
 
   std::string_view signature(const x509_t &x) {
     return signature(x.get());
+  }
+
+  bool secure_random_bytes(std::size_t bytes, std::string &out) {
+    out.clear();
+    if (bytes == 0 || bytes > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+      return false;
+    }
+
+    std::string candidate(bytes, '\0');
+    if (RAND_bytes(reinterpret_cast<unsigned char *>(candidate.data()), static_cast<int>(candidate.size())) != 1) {
+      OPENSSL_cleanse(candidate.data(), candidate.size());
+      return false;
+    }
+
+    out = std::move(candidate);
+    return true;
   }
 
   std::string rand(std::size_t bytes) {
